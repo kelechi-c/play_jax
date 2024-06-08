@@ -4,18 +4,30 @@ import cv2
 import os
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
+
+
+def get_image_files_and_labels(dir):
+    for folder, _, filenames in tqdm(os.walk(dir)):
+        for file in filenames:
+            file_path = os.path.join(folder, file)
+
+            label = folder.split('/')[4]
+            yield (file_path, label)
 
 
 def read_img(image_data):
-    image = cv2.imread(image_data)
+    try:
+        image = cv2.imread(image_data)
 
-    if image is None:
-        raise ValueError("Could not read the image data.")
-
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = cv2.resize(image, (200, 200))
-    image = np.array(image, dtype=np.float32) / 255.0  # Normalize the image
-    return image
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (200, 200))
+        image = np.array(image, dtype=np.float32) / 255.0  # Normalize the image
+        return image
+    
+    except Exception as e:
+        print(f'Error> {e}')
+        
 
 
 def load_images_from_directory(csv_file):
