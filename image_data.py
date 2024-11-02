@@ -1,6 +1,9 @@
 from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
-
+from katara import read_image
+import jax, jax.numpy as jnp
+import numpy as np
+import cv2
 
 class config:
     dataset_id = ""
@@ -8,25 +11,43 @@ class config:
     split = 10000
 
 
-hfdata = load_dataset(config.dataset_id, split="train", streaming=True)
-hfdata = hfdata.take(config.split)
+def read_image(img, img_size: int = 32):
+    img = np.array(img)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img / 255.0
+
+    return img
 
 
-class ImageNet(IterableDataset):
-    def __init__(self, dataset=hfdata):
+class ImageData(IterableDataset):
+    def __init__(self, dataset):
         super().__init__()
         self.dataset = dataset
 
+    def __len__(self):
+        return config.split
+
     def __iter__(self):
-        for item in self.dataset:
-            image = read_image(item["image"])
-            label = item["label"]
+        for sample in self.dataset:
+            image = sample["img"]
+            image = read_image(image)
 
-            image = torch.tensor(image, dtype=config.dtype)
-            label = torch.tensor(label, dtype=config.dtype)
+            image = jnp.array(image)
+            label = jnp.array(sample["label"])
 
-            yield image, label
+            yield image, label  # sample["label"]#label
 
 
-img_dataset = ImageNet()
-train_loader = DataLoader(img_dataset, config.batch_size, shuffle=True)
+def jax_collate(batch):
+    images, labels = zip(*batch)
+    batch = (jnp.array(images), jnp.array(labels))
+    batch = jax.tree_util.tree_map(jnp.array, batch)
+    return batch
+
+
+traindata = ImageData()
+train_loader = DataLoader(traindata, batch_size=32, collate_fn=jax_collate)
+
+xc = next(iter(train_loader))
+
+xc[0].shape, xc[1].shape
