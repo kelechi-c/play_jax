@@ -4,6 +4,7 @@ import optax, cv2, wandb, numpy as np
 from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 from tqdm.auto import tqdm
+from functools import partial
 
 
 # confirm devices
@@ -44,6 +45,7 @@ def jax_collate(batch):
     images, labels = zip(*batch)
     batch = (jnp.array(images), jnp.array(labels))
     batch = jax.tree_util.tree_map(jnp.array, batch)
+    
     return batch
 
 
@@ -53,8 +55,6 @@ train_loader = DataLoader(traindata, batch_size=32, collate_fn=jax_collate)
 xc = next(iter(train_loader))
 
 # xc[0].shape, xc[1].shape
-
-from functools import partial
 
 
 class MobileBlock(nnx.Module):
@@ -97,9 +97,12 @@ class JaxMobilenet(nnx.Module):
             MobileBlock(128, 256, stride=2, rngs=rngs),
             MobileBlock(256, 512, stride=2, rngs=rngs),
             MobileBlock(512, 512, rngs=rngs),
+            MobileBlock(512, 512, rngs=rngs),
+            MobileBlock(512, 512, rngs=rngs),
             MobileBlock(512, 1024, stride=2, rngs=rngs),
         )
-        self.linear_fc = nnx.Linear(256, num_classes, rngs=rngs)
+
+        self.linear_fc = nnx.Linear(2048, num_classes, rngs=rngs)
 
     def __call__(self, x_img: jax.Array):
         x = self.batchnorm(self.inputconv(x_img))
@@ -108,10 +111,12 @@ class JaxMobilenet(nnx.Module):
         x = self.avg_pool(x)
 
         print(x.shape)
-        x = jnp.mean(x, axis=(1, 2))
-        print(x.shape)
+        x = x.reshape((x.shape[0], -1))
+        # x = jnp.mean(x, axis=(1, 2))
+
+        # print(x.shape)
         x = self.linear_fc(x)
-        print(x.shape)
+        # print(x.shape)
 
         return nnx.softmax(x, axis=1)
 
@@ -119,10 +124,17 @@ class JaxMobilenet(nnx.Module):
 cnn_model = JaxMobilenet(rngs=nnx.Rngs(0))
 # nnx.display(cnn_model)
 
+s = cnn_model(xc[0])
+# s.shape
+
+cnn_model = JaxMobilenet(rngs=nnx.Rngs(0))
+nnx.display(cnn_model)
+
 sample = cnn_model(xc[0])
 
 
 learn_rate = 1e-4
+
 optimizer = nnx.Optimizer(cnn_model, optax.adamw(learning_rate=learn_rate))
 metrics = nnx.MultiMetric(
     accuracy=nnx.metrics.Accuracy(), loss=nnx.metrics.Average("loss")
@@ -138,11 +150,10 @@ def loss_func(model, batch):
     return loss, logits
 
 
-def wandb_logger(key: str, model, project_name, run_name):  # wandb logger
+def wandb_logger(key: str, project_name, run_name):  # wandb logger
     # initilaize wandb
     wandb.login(key=key)
     wandb.init(project=project_name, name=run_name)
-    wandb.watch(model)
 
 
 @nnx.jit
@@ -160,20 +171,23 @@ def trainer(model=cnn_model, optimizer=optimizer, train_loader=train_loader):
     epochs = 10
     train_loss = 0.0
     accuracy = 0.0
-    # wandb_logger(key=None, model=model, project_name='play_jax', run_name='mobilecifar-256c')
+    wandb_logger(
+        key=None,
+        model=model,
+        project_name="play_jax",
+        run_name="mobilecifar-1e4-10k-tpu",
+    )
 
     for epoch in tqdm(range(epochs)):
-        for step, batch in tqdm(enumerate(train_loader)):
+        for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
 
             train_loss, accuracy = train_step(model, optimizer, metrics, batch)
+            # print(f"step {step}, loss-> {train_loss.item():.4f}, acc {accuracy.item():.4f}")
 
-            print(
-                f"step {step}, loss-> {train_loss.item():.4f}, acc {accuracy.item():.4f}"
-            )
-
-            # wandb.log({'loss': train_loss, 'accuracy':accuracy})
+            wandb.log({"loss": train_loss.item(), "accuracy": accuracy.item()})
 
         print(f"epoch {epoch}, train loss {train_loss}, accuracy: {accuracy*100:.4f}")
 
 
 trainer()
+wandb.finish()
