@@ -95,6 +95,9 @@ class JaxMobilenet(nnx.Module):
             MobileBlock(32, 64, rngs=rngs),
             MobileBlock(64, 128, stride=2, rngs=rngs),
             MobileBlock(128, 256, stride=2, rngs=rngs),
+            MobileBlock(256, 512, stride=2, rngs=rngs),
+            MobileBlock(512, 512, rngs=rngs),
+            MobileBlock(512, 1024, stride=2, rngs=rngs),
         )
         self.linear_fc = nnx.Linear(256, num_classes, rngs=rngs)
 
@@ -105,9 +108,7 @@ class JaxMobilenet(nnx.Module):
         x = self.avg_pool(x)
 
         print(x.shape)
-        # x = x.reshape((x.shape[0], -1))
         x = jnp.mean(x, axis=(1, 2))
-        # x = x.flatten()
         print(x.shape)
         x = self.linear_fc(x)
         print(x.shape)
@@ -124,14 +125,15 @@ sample = cnn_model(xc[0])
 learn_rate = 1e-4
 optimizer = nnx.Optimizer(cnn_model, optax.adamw(learning_rate=learn_rate))
 metrics = nnx.MultiMetric(
-    accuracy=nnx.metrics.Accuracy(),
-    loss=nnx.metrics.Average('loss')
+    accuracy=nnx.metrics.Accuracy(), loss=nnx.metrics.Average("loss")
 )
 
-def loss_func(batch, model=cnn_model):
+
+def loss_func(model, batch):
     image, label = batch
+    # print(f"image shape: {image.shape}")
     logits = model(image)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, label).mean()
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels=label).mean()
 
     return loss, logits
 
@@ -145,25 +147,33 @@ def wandb_logger(key: str, model, project_name, run_name):  # wandb logger
 
 @nnx.jit
 def train_step(model, optimizer, metrics: nnx.MultiMetric, batch):
-    gradfn = nnx.value_and_grad(loss_func, has_aux=True)
-    (loss, logits), grads = gradfn(batch, model)
+    gradfn = nnx.value_and_grad(loss_func, has_aux=True, allow_int=True)
+    (loss, logits), grads = gradfn(model, batch)
     metrics.update(loss=loss, logits=logits, labels=batch[1])
     optimizer.update(grads)
-    
-    acc = metrics.compute()['accuracy']
+
+    acc = metrics.compute()["accuracy"]
     return loss, acc
+
 
 def trainer(model=cnn_model, optimizer=optimizer, train_loader=train_loader):
     epochs = 10
-    wandb_logger(key=None, model=model, project_name='play_jax', run_name='mobilecifar-256c')
-    
-    for epoch in tqdm.range(epochs):
+    train_loss = 0.0
+    accuracy = 0.0
+    # wandb_logger(key=None, model=model, project_name='play_jax', run_name='mobilecifar-256c')
+
+    for epoch in tqdm(range(epochs)):
         for step, batch in tqdm(enumerate(train_loader)):
-            
+
             train_loss, accuracy = train_step(model, optimizer, metrics, batch)
-            
-            print(f'step {step}, loss-> {train_loss.item():.4f}, acc {accuracy.item():.4f}')
-            
-            wandb.log({'loss': train_loss, 'accuracy':accuracy})
-            
-        print(f'epoch {epoch}, train loss mode')
+
+            print(
+                f"step {step}, loss-> {train_loss.item():.4f}, acc {accuracy.item():.4f}"
+            )
+
+            # wandb.log({'loss': train_loss, 'accuracy':accuracy})
+
+        print(f"epoch {epoch}, train loss {train_loss}, accuracy: {accuracy*100:.4f}")
+
+
+trainer()
