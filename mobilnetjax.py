@@ -37,7 +37,7 @@ class ImageData(IterableDataset):
             image = jnp.array(image)
             label = jnp.array(sample["label"])
 
-            yield image, label  # sample["label"]#label
+            yield image, label
 
 
 def jax_collate(batch):
@@ -54,50 +54,72 @@ xc = next(iter(train_loader))
 
 # xc[0].shape, xc[1].shape
 
+from functools import partial
+
 
 class MobileBlock(nnx.Module):
-    def __init__(self, inchan, outchan, stride=1):
+    def __init__(self, inchan, outchan, rngs: nnx.Rngs, stride=1):
         self.depthwise_conv = nnx.Sequential(
             nnx.Conv(
-                inchan, inchan, kernel_size=3, 
-                strides=stride, padding=1, feature_group_count=inchan
+                inchan,
+                inchan,
+                kernel_size=(3, 3),
+                strides=stride,
+                padding=1,
+                feature_group_count=inchan,
+                rngs=rngs,
             ),
-            nnx.BatchNorm(inchan)
+            nnx.BatchNorm(inchan, rngs=rngs),
         )
         self.pointwise = nnx.Sequential(
-            nnx.Conv(inchan, outchan, kernel_size=1, strides=1, padding=0),
-            nnx.BatchNorm(outchan)
+            nnx.Conv(
+                inchan, outchan, kernel_size=(1, 1), strides=1, padding=0, rngs=rngs
+            ),
+            nnx.BatchNorm(outchan, rngs=rngs),
         )
 
     def __call__(self, x_img):
         x = nnx.relu(self.depthwise_conv(x_img))
         x = nnx.relu(self.pointwise(x))
-        
+
         return x
 
 
 class JaxMobilenet(nnx.Module):
-    def __init__(self, num_classes=10):
-        self.inputconv = nnx.Conv(3, 32, kernel_size=3, strides=2, padding=1)
-        self.batchnorm = nnx.BatchNorm(32)
-        
+    def __init__(self, rngs: nnx.Rngs, num_classes=10):
+        self.inputconv = nnx.Conv(3, 32, kernel_size=3, strides=2, padding=1, rngs=rngs)
+        self.batchnorm = nnx.BatchNorm(32, rngs=rngs)
+        self.avg_pool = partial(nnx.avg_pool, window_shape=(1, 1), strides=(1, 1))
+
         self.convlayer = nnx.Sequential(
-            MobileBlock(32, 64),
-            MobileBlock(64, 128, stride=2),
-            MobileBlock(128, 256, stride=2),    
+            MobileBlock(32, 64, rngs=rngs),
+            MobileBlock(64, 128, stride=2, rngs=rngs),
+            MobileBlock(128, 256, stride=2, rngs=rngs),
         )
-        self.linear_fc = nnx.Linear(256, num_classes)
-    
+        self.linear_fc = nnx.Linear(256, num_classes, rngs=rngs)
+
     def __call__(self, x_img: jax.Array):
         x = self.batchnorm(self.inputconv(x_img))
         x = nnx.relu(x)
         x = self.convlayer(x)
-        x = x.view(-1, 256)
-        
-        return x #nnx.softmax(x, axis=1)
+        x = self.avg_pool(x)
 
-cnn_model = JaxMobilenet()
-nnx.display(cnn_model)
+        print(x.shape)
+        # x = x.reshape((x.shape[0], -1))
+        x = jnp.mean(x, axis=(1, 2))
+        # x = x.flatten()
+        print(x.shape)
+        x = self.linear_fc(x)
+        print(x.shape)
+
+        return nnx.softmax(x, axis=1)
+
+
+cnn_model = JaxMobilenet(rngs=nnx.Rngs(0))
+# nnx.display(cnn_model)
+
+sample = cnn_model(xc[0])
+
 
 learn_rate = 1e-4
 optimizer = nnx.Optimizer(cnn_model, optax.adamw(learning_rate=learn_rate))
@@ -121,8 +143,6 @@ def wandb_logger(key: str, model, project_name, run_name):  # wandb logger
     wandb.watch(model)
 
 
-@jax.pmap(axis_name="batch")
-@jax.pmap(axis_name="model")
 @nnx.jit
 def train_step(model, optimizer, metrics: nnx.MultiMetric, batch):
     gradfn = nnx.value_and_grad(loss_func, has_aux=True)
