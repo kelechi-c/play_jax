@@ -11,6 +11,7 @@ hidden_size = 1024
 n_layers = 12
 key = jax.random.key(3)
 
+
 class CausalSelfAttention(nnx.Module):
     def __init__(
         self,
@@ -39,7 +40,7 @@ class CausalSelfAttention(nnx.Module):
         q, k, v = map(
             lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v)
         )
-        attn_weight = q @ jnp.matrix_transpose(k)  # k.transpose(-1)
+        attn_weight = q @ jnp.matrix_transpose(k)
         attn_weight /= math.sqrt(self.head_dim)  # attention computation
         print(f"attn 1 shape => {attn_weight.shape}")
 
@@ -49,7 +50,7 @@ class CausalSelfAttention(nnx.Module):
         print(mask.shape)
         attn_logits = jnp.where(
             mask == 0, jnp.inf, attn_weight
-        )  # attn_weight - jnp.inf * mask[None, None, :, :]
+        )
 
         attn_score = nnx.softmax(attn_logits, axis=-1)
         attn_output = attn_score @ v
@@ -68,11 +69,11 @@ print(attx.shape)
 
 
 class MLP(nnx.Module):
-    def __init__(self, hidden_size, rngs: nnx.Rngs):
+    def __init__(self, embed_dim, rngs: nnx.Rngs):
         super().__init__()
-        self.layernorm = nnx.LayerNorm(hidden_size, rngs=rngs)
-        self.linear1 = nnx.Linear(hidden_size, 2 * hidden_size, rngs=rngs)
-        self.linear2 = nnx.Linear(2 * hidden_size, hidden_size, rngs=rngs)
+        self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
+        self.linear1 = nnx.Linear(embed_dim, 2 * embed_dim, rngs=rngs)
+        self.linear2 = nnx.Linear(2 * embed_dim, embed_dim, rngs=rngs)
 
     def __call__(self, x_input: jax.Array) -> jax.Array:
         x = self.layernorm(x_input)
@@ -83,11 +84,11 @@ class MLP(nnx.Module):
 
 
 class DecoderBlock(nnx.Module):
-    def __init__(self, embed_dim, rngs: nnx.Rngs, hidden_size=1024):
+    def __init__(self, rngs: nnx.Rngs, embed_dim=embed_dim, hidden_size=1024):
         super().__init__()
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
         self.attention = CausalSelfAttention(rngs=rngs)
-        self.ffn_layer = MLP(hidden_size=hidden_size, rngs=rngs)
+        self.ffn_layer = MLP(embed_dim, rngs=rngs)
 
     def __call__(self, x_token: jax.Array) -> jax.Array:
         x = x_token + self.layernorm(self.attention(x_token))
@@ -98,25 +99,20 @@ class DecoderBlock(nnx.Module):
 
 # autoregressive transformer block, or just an SLM
 class Transformer(nnx.Module):
-    def __init__(self, n_layers, embed_dim, rngs: nnx.Rngs, hidden_size=1024, vocab_size=32000):
+    def __init__(
+        self, n_layers, embed_dim, rngs: nnx.Rngs, hidden_size=1024, vocab_size=32000
+    ):
         super().__init__()
         self.wtoken_embed = nnx.Embed(vocab_size, embed_dim, rngs=rngs)
         self.pos_embed = nnx.Embed(hidden_size, embed_dim, rngs=rngs)
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
         decoder_layers = [DecoderBlock(rngs=rngs) for _ in range(n_layers)]
-        self.decoder_layers = nnx.Sequential(**decoder_layers)
+        self.decoder_layers = nnx.Sequential(*decoder_layers)
         self.lm_head = nnx.Linear(embed_dim, vocab_size, rngs=rngs)
 
     def __call__(self, x_tokens: jax.Array) -> jax.Array:
-        b_size, token_len = x_tokens.size()
-        pos = jnp.arange(0, token_len, device=x_tokens.device)
-        token_embed = self.wtoken_embed(x_tokens)
-        pos_embed = self.pos_embed(pos)
-
-        x = token_embed + pos_embed
-
-        x = self.layernorm(self.decoder_layers(x))
-        print(f'decoder out shape => {x.shape}')
+        x = self.layernorm(self.decoder_layers(x_tokens))
+        print(f"decoder out shape => {x.shape}")
 
         x = self.lm_head(x)
         output = nnx.softmax(x, axis=1)
@@ -127,7 +123,12 @@ class Transformer(nnx.Module):
     def generate(self, cond_token, max_outlen=256, temperature=0.1):
         pass
 
+
 slm_model = Transformer(n_layers, embed_dim, rngs=nnx.Rngs(3))
+
+# nnx.display(slm_model)
+s = slm_model(jnp.ones((1, 20, 768)))
+print(s.shape)
 
 graph, state = nnx.split(slm_model)
 n_params = sum([p.size for p in jax.tree.leaves(state)])
