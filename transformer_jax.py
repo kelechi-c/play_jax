@@ -74,24 +74,32 @@ class DecoderBlock(nnx.Module):
         x = x + self.layernorm(self.ffn_layer(x))
 
         return x
-    
+
 # autoregressive transformer block, or just an SLM
 class Transformer(nnx.Module):
     def __init__(self, n_layers, embed_dim, rngs: nnx.Rngs, hidden_size=1024, vocab_size=32000):
         super().__init__()
-        self.wt_embed = nnx.Embed(vocab_size, embed_dim, rngs=rngs)
-        self.wp_embed = nnx.Embed(hidden_size, embed_dim, rngs=rngs)
+        self.wtoken_embed = nnx.Embed(vocab_size, embed_dim, rngs=rngs)
+        self.pos_embed = nnx.Embed(hidden_size, embed_dim, rngs=rngs)
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
         decoder_layers = [DecoderBlock(rngs=rngs) for _ in range(n_layers)]
         self.decoder_layers = nnx.Sequential(**decoder_layers)
         self.lm_head = nnx.Linear(embed_dim, vocab_size, rngs=rngs)
 
     def forward(self, x_tokens: jax.Array) -> jax.Array:
-        x = self.layernorm(self.decoder_layers(x_tokens))
+        b_size, token_len = x_tokens.size()
+        pos = jnp.arange(0, token_len, device=x_tokens.device)
+        token_embed = self.wtoken_embed(x_tokens)
+        pos_embed = self.pos_embed(pos)
+        
+        x = token_embed + pos_embed
+        
+        x = self.layernorm(self.decoder_layers(x))
         print(f'decoder out shape => {x.shape}')
+        
         x = self.lm_head(x)
         output = nnx.softmax(x, axis=1)
-        print(f"lm/softmax out shape => {x.shape}")
+        print(f"lm/softmax out shape => {output.shape}")
 
         return output
 
@@ -100,8 +108,9 @@ class Transformer(nnx.Module):
         pass
 
 
-slm_model = Transformer(12, 768, rngs=nnx.Rngs(3))
+slm_model = Transformer(n_layers, embed_dim, rngs=nnx.Rngs(3))
 
 graph, params, _ = nnx.split(slm_model, nnx.Param)
 n_params = sum([p.size for p in jax.tree_leaves(params)])
+
 print(f'number of parameters: {n_params}')
