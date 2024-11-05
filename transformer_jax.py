@@ -1,8 +1,10 @@
 import jax, math
 from jax import numpy as jnp
-from flax.experimental import nnx
+from flax import nnx
 from einops import rearrange
-
+from datasets import load_dataset
+from transformers import GPT2Tokenizer
+from torch.utils.data import DataLoader, IterableDataset
 
 attn_heads = 6
 embed_dim = 768
@@ -10,7 +12,33 @@ vocab_size = 32000
 hidden_size = 1024
 n_layers = 12
 key = jax.random.key(3)
+split = 10000
 
+# confirm devices
+print(f"JAX devices: {jax.local_devices()}")
+
+hfdata = load_dataset("roneneldan/TinyStories", split="train", streaming=True).take(split)
+
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+
+
+class StoryData(IterableDataset):
+    def __init__(self, dataset=hfdata):
+        super().__init__()
+        self.dataset = dataset
+
+    def __len__(self):
+        return split
+
+    def __iter__(self):
+        for sample in self.dataset:
+            tokens = tokenizer.encode(sample["text"])
+
+            tokens = jnp.array(tokens)
+
+            yield tokens
+
+data = StoryData()
 
 class CausalSelfAttention(nnx.Module):
     def __init__(
@@ -111,6 +139,13 @@ class Transformer(nnx.Module):
         self.lm_head = nnx.Linear(embed_dim, vocab_size, rngs=rngs)
 
     def __call__(self, x_tokens: jax.Array) -> jax.Array:
+        b_size, token_len, _ = x_tokens.shape
+        pos = jnp.arange(0, token_len, device=x_tokens.device, dtype=jnp.int64)
+        token_embed = self.wtoken_embed(x_tokens.astype(jnp.int64))
+        pos_embed = self.pos_embed(pos)
+
+        x = token_embed + pos_embed
+
         x = self.layernorm(self.decoder_layers(x_tokens))
         print(f"decoder out shape => {x.shape}")
 
