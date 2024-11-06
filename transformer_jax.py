@@ -1,10 +1,13 @@
-import jax, math, optax
+import jax, math, optax, wandb
 from jax import numpy as jnp
 from flax import nnx
+from flax.training import checkpoints
 from einops import rearrange
+from tqdm.auto import tqdm
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
 from torch.utils.data import DataLoader, IterableDataset
+
 
 attn_heads = 6
 embed_dim = 768
@@ -185,6 +188,12 @@ print(f"number of parameters: {n_params/1e6:.3f}M")
 optimizer = nnx.Optimizer(slm_model, optax.adamw(learning_rate=learn_rate))
 
 
+def wandb_logger(key: str, project_name, run_name):  # wandb logger
+    # initilaize wandb
+    wandb.login(key=key)
+    wandb.init(project=project_name, name=run_name)
+
+
 def loss_func(model, batch):
     tokens, attn_mask = batch["token_ids"], batch["attention_mask"]
     
@@ -199,3 +208,46 @@ def loss_func(model, batch):
     loss = optax.softmax_cross_entropy(output, targets).mean()
 
     return loss, logits
+
+@nnx.jit
+def train_step(model, optimizer, batch):
+    gradfn = nnx.value_and_grad(loss_func, has_aux=True)
+    (loss, logits), grads = gradfn(model, batch)
+    optimizer.update(grads)
+
+    return loss
+
+
+def trainer(model, optimizer, train_loader):
+    epochs = 10
+    train_loss = 0.0
+    wandb_logger(
+        key=None,
+        model=model,
+        project_name="transformer_playjax",
+        run_name="tinygpt-1e-4-bs32-tpu",
+    )
+
+    for epoch in tqdm(range(epochs)):
+        for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+
+            train_loss = train_step(model, optimizer, batch)
+            print(f"step {step}, loss-> {train_loss.item():.4f}")
+
+            wandb.log({"loss": train_loss.item()})
+
+        print(f"epoch {epoch}, train loss => {train_loss}")
+
+def save_model(model: nnx.Module, file: str):
+    graph, params = nnx.split(model)
+    checkpoints.save_checkpoint(
+        ckpt_dir=file,
+        target=params, 
+        step=100,  # Training step or other metric to save best model on
+        prefix="ar_jax",  # Checkpoint file name prefix
+        overwrite=True,  # Overwrite existing checkpoint files
+    )
+
+trainer(slm_model, optimizer, train_loader)
+wandb.finish()
+print('mini AR transformer training in JAX....done')
