@@ -1,4 +1,4 @@
-import jax, math
+import jax, math, optax
 from jax import numpy as jnp
 from flax import nnx
 from einops import rearrange
@@ -13,6 +13,7 @@ hidden_size = 1024
 n_layers = 12
 key = jax.random.key(3)
 split = 10000
+learn_rate = 1e-4
 
 # confirm devices
 print(f"JAX devices: {jax.local_devices()}")
@@ -32,13 +33,32 @@ class StoryData(IterableDataset):
 
     def __iter__(self):
         for sample in self.dataset:
-            tokens = tokenizer.encode(sample["text"])
+            tokens = tokenizer(
+                sample["text"], truncation=True, return_temsors='np',
+                padding="max_length", max_length=1024
+            )
 
-            tokens = jnp.array(tokens)
+            token_ids = tokens["input_ids"]
+            attn_mask = tokens["attention_mask"]
 
-            yield tokens
+            tokens, attn_mask = jnp.array(token_ids), jnp.array(attn_mask)
 
-data = StoryData()
+            yield {"input_ids": tokens, "attention_mask": attn_mask}
+
+
+def jax_collate(batch):
+    batch = jnp.array(batch)
+    batch = jax.tree_util.tree_map(jnp.array, batch)
+
+    return batch
+
+
+textdata = StoryData()
+train_loader = DataLoader(textdata, batch_size=32, collate_fn=jax_collate)
+
+vs = next(iter(train_loader))
+print(vs.shape)
+
 
 class CausalSelfAttention(nnx.Module):
     def __init__(
@@ -65,27 +85,20 @@ class CausalSelfAttention(nnx.Module):
         k = self.k_linear(x_input)
         v = self.v_linear(x_input)
 
-        q, k, v = map(
-            lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v)
-        )
+        q, k, v = map(lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v))
         attn_weight = q @ jnp.matrix_transpose(k)
         attn_weight /= math.sqrt(self.head_dim)  # attention computation
-        print(f"attn 1 shape => {attn_weight.shape}")
 
         b, h, l, d = q.shape  # just getting the shape, hehe
         # causal attention mask
         mask = jnp.tril(jnp.ones((l, l)), k=1).astype(x_input.dtype)
-        print(mask.shape)
-        attn_logits = jnp.where(
-            mask == 0, jnp.inf, attn_weight
-        )
+        attn_logits = jnp.where(mask == 0, jnp.inf, attn_weight)
 
         attn_score = nnx.softmax(attn_logits, axis=-1)
         attn_output = attn_score @ v
 
         output = rearrange(attn_output, "b h l d -> b l (h d)")
         output = self.dropout(self.outproject(output))
-        print(f"MHSA out shape => {output.shape}")
 
         return output
 
@@ -160,11 +173,29 @@ class Transformer(nnx.Module):
 
 
 slm_model = Transformer(n_layers, embed_dim, rngs=nnx.Rngs(3))
-
 # nnx.display(slm_model)
+
 s = slm_model(jnp.ones((1, 20, 768)))
 print(s.shape)
 
 graph, state = nnx.split(slm_model)
 n_params = sum([p.size for p in jax.tree.leaves(state)])
 print(f"number of parameters: {n_params/1e6:.3f}M")
+
+optimizer = nnx.Optimizer(slm_model, optax.adamw(learning_rate=learn_rate))
+
+
+def loss_func(model, batch):
+    tokens, attn_mask = batch["token_ids"], batch["attention_mask"]
+    
+    logits = model(tokens)
+    
+    output = logits[..., :-1, :]
+    targets = tokens[..., 1:]
+    
+    output = output.view(-1, output.size(-1))
+    targets = targets.view(-1)
+    
+    loss = optax.softmax_cross_entropy(output, targets).mean()
+
+    return loss, logits
