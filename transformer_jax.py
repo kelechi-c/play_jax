@@ -194,20 +194,33 @@ def wandb_logger(key: str, project_name, run_name):  # wandb logger
     wandb.init(project=project_name, name=run_name)
 
 
-def loss_func(model, batch):
-    tokens, attn_mask = batch["token_ids"], batch["attention_mask"]
-    
-    logits = model(tokens)
-    
+def modelpass(logits, tokens):
+
     output = logits[..., :-1, :]
-    targets = tokens[..., 1:]
-    
-    output = output.view(-1, output.size(-1))
-    targets = targets.view(-1)
-    
+    targets = tokens[..., 1:].squeeze(1)
+
+    output = output.reshape(-1, output.shape[-1])
+    targets = targets.reshape(-1)
+
+    output = output.astype(jnp.float32)
+    targets = targets.astype(jnp.float32)
+  
+    return output, targets
+
+
+def loss_func(model, batch):
+    tokens = batch["input_ids"]
+    logits = model(tokens)
+
+    logits = logits.astype(jnp.float32)
+    tokens = tokens.astype(jnp.float32)
+
+    output, targets = modelpass(logits, tokens)
+
     loss = optax.softmax_cross_entropy(output, targets).mean()
 
     return loss, logits
+
 
 @nnx.jit
 def train_step(model, optimizer, batch):
@@ -217,16 +230,16 @@ def train_step(model, optimizer, batch):
 
     return loss
 
-
 def trainer(model, optimizer, train_loader):
-    epochs = 10
+    epochs = 1
     train_loss = 0.0
-    wandb_logger(
-        key=None,
-        model=model,
-        project_name="transformer_playjax",
-        run_name="tinygpt-1e-4-bs32-tpu",
-    )
+    model.train()
+    # wandb_logger(
+    #     key=None,
+    #     model=model,
+    #     project_name="transformer_playjax",
+    #     run_name="tinygpt-1e-4-bs32-tpu",
+    # )
 
     for epoch in tqdm(range(epochs)):
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
@@ -234,19 +247,10 @@ def trainer(model, optimizer, train_loader):
             train_loss = train_step(model, optimizer, batch)
             print(f"step {step}, loss-> {train_loss.item():.4f}")
 
-            wandb.log({"loss": train_loss.item()})
+            # wandb.log({"loss": train_loss.item()})
 
-        print(f"epoch {epoch}, train loss => {train_loss}")
+        print(f"epoch {epoch+1}, train loss => {train_loss}")
 
-def save_model(model: nnx.Module, file: str):
-    graph, params = nnx.split(model)
-    checkpoints.save_checkpoint(
-        ckpt_dir=file,
-        target=params, 
-        step=100,  # Training step or other metric to save best model on
-        prefix="ar_jax",  # Checkpoint file name prefix
-        overwrite=True,  # Overwrite existing checkpoint files
-    )
 
 trainer(slm_model, optimizer, train_loader)
 wandb.finish()
