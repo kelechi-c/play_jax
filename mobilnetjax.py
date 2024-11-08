@@ -110,13 +110,9 @@ class JaxMobilenet(nnx.Module):
         x = self.convlayer(x)
         x = self.avg_pool(x)
 
-        print(x.shape)
         x = x.reshape((x.shape[0], -1))
-        # x = jnp.mean(x, axis=(1, 2))
 
-        # print(x.shape)
         x = self.linear_fc(x)
-        # print(x.shape)
 
         return nnx.softmax(x, axis=1)
 
@@ -143,7 +139,6 @@ metrics = nnx.MultiMetric(
 
 def loss_func(model, batch):
     image, label = batch
-    # print(f"image shape: {image.shape}")
     logits = model(image)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels=label).mean()
 
