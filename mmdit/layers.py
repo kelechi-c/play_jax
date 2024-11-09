@@ -13,11 +13,13 @@ class config:
     img_size: int = 256
     patch_size: int = 4
 
+rkey = jrand.key(3)
 
 # input patchify layer, 2D image to patches
 class PatchEmbed(nnx.Module):
     def __init__(
         self,
+        rngs: nnx.Rngs,
         patch_size: int=4,
         img_size: int=256,
         in_chan: int=3,
@@ -94,7 +96,7 @@ class SelfAttention(nnx.Module):
         output = self.dropout(self.outproject(output))
         print(f'attn out shape => {output.shape}')
         return output
-    
+
 class SwigluFFN(nnx.Module):
     def __init__(self, input_dim, hidden_dim, mlp_ratio):
         super().__init__()
@@ -108,3 +110,55 @@ class SwigluFFN(nnx.Module):
         x = self.lin_3(x)
         
         return x
+
+
+class RMSNorm(nnx.Module):
+    def __init__(self, hidden_dim, eps, elementwise_affine):
+        super().__init__()
+        self.eps = eps
+        self.learnable_scale = elementwise_affine
+        self.weight = nnx.Param(jnp.empty(hidden_dim))
+
+    def _rmsnorm(self, x: Array) -> Array:
+        x = jnp.pow(x, 2).mean(axis=-1, keepdims=True) + self.eps
+        x = x * (1 / x**0.5)
+
+        return x
+
+    def __call__(self, x: Array) -> Array:
+        x = self._rmsnorm(x)
+        x = x * self.weight.to_device(x.device)
+
+        return x
+
+class FinalMLP(nnx.Module):
+    def __init__(self, hidden_size, patch_size, out_chan, rngs: nnx.Rngs):
+        super().__init__()
+        self.layernorm = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.linear = nnx.Linear(hidden_size, patch_size*patch_size*out_chan, rngs=rngs)
+        self.adaln_mod = nnx.Linear(hidden_size, 2*hidden_size, rngs=rngs)
+
+    def __call__(self, x_input: Array, cond: Array) -> Array:
+        cond_mod = nnx.silu(self.adaln_mod(cond))
+        shift, scale = jnp.split(cond_mod, axis=1)
+        x = modulate(self.layernorm(x_input), shift, scale)
+        x = self.linear(x)
+
+        return x
+    
+
+class DismantledDiTBlock(nnx.Module):
+    def __init__(
+            self,
+            hidden_size,
+            attn_heads,
+            mlp_ratio, rms_norm, rngs
+        ):
+        super().__init__()
+        if rms_norm:
+            self.norm = RMSNorm(hidden_dim=hidden_size, eps=1e-6, elementwise_affine=False) 
+        else:
+            self.norm = nnx.LayerNorm(hidden_size, epsilon=1e-6)
+        
+        self.attention = SelfAttention(attn_heads, embed_dim=hidden_size, rngs=rngs)
+        self.
