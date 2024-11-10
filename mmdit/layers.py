@@ -147,7 +147,7 @@ class FinalMLP(nnx.Module):
         return x
     
 
-class DismantledDiTBlock(nnx.Module):
+class MMDiTblock(nnx.Module):
     def __init__(
             self,
             hidden_size,
@@ -161,4 +161,3 @@ class DismantledDiTBlock(nnx.Module):
             self.norm = nnx.LayerNorm(hidden_size, epsilon=1e-6)
         
         self.attention = SelfAttention(attn_heads, embed_dim=hidden_size, rngs=rngs)
-        self.
