@@ -11,6 +11,13 @@ def jax_collate(batch):
 
     return batch
 
+def nnx_param_count(model):
+    graph, state = nnx.split(model)
+    n_params = sum([p.size for p in jax.tree.leaves(state)])
+    print(f"number of parameters: {n_params/1e6:.3f}M")
+    
+    return n_params
+
 
 def loss_func(model, batch):
     image, label = batch
