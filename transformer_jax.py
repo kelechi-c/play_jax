@@ -38,7 +38,7 @@ class StoryData(IterableDataset):
         for sample in self.dataset:
             tokens = tokenizer(
                 sample["text"], truncation=True, return_temsors='np',
-                padding="max_length", max_length=1024
+                padding="max_length", max_length=128
             )
 
             token_ids = tokens["input_ids"]
@@ -60,7 +60,7 @@ textdata = StoryData()
 train_loader = DataLoader(textdata, batch_size=32, collate_fn=jax_collate)
 
 vs = next(iter(train_loader))
-print(vs.shape)
+print(vs['input_ids'].shape)
 
 
 class CausalSelfAttention(nnx.Module):
@@ -95,10 +95,10 @@ class CausalSelfAttention(nnx.Module):
         b, h, l, d = q.shape  # just getting the shape, hehe
         # causal attention mask
         mask = jnp.tril(jnp.ones((l, l)), k=1).astype(x_input.dtype)
-        attn_logits = jnp.where(mask == 0, jnp.inf, attn_weight)
+        attn_logits = jnp.where(mask == 0, -jnp.inf, attn_weight)
 
         attn_score = nnx.softmax(attn_logits, axis=-1)
-        attn_output = attn_score @ v
+        attn_output = attn_score @ v 
 
         output = rearrange(attn_output, "b h l d -> b l (h d)")
         output = self.dropout(self.outproject(output))
@@ -107,7 +107,7 @@ class CausalSelfAttention(nnx.Module):
 
 
 attn_block = CausalSelfAttention(rngs=nnx.Rngs(3))
-rand_input = jax.random.normal(key=key, shape=(1, 384, 768), dtype=jnp.float16)
+rand_input = jax.random.normal(key=key, shape=(1, 128, 768), dtype=jnp.float16)
 attx = attn_block(rand_input)
 print(attx.shape)
 
@@ -147,15 +147,18 @@ class Transformer(nnx.Module):
         self, n_layers, embed_dim, rngs: nnx.Rngs, hidden_size=1024, vocab_size=32000
     ):
         super().__init__()
-        self.wtoken_embed = nnx.Embed(vocab_size, embed_dim, rngs=rngs)
-        self.pos_embed = nnx.Embed(hidden_size, embed_dim, rngs=rngs)
+        embed_init = nnx.initializers.normal(0.02)
+        self.wtoken_embed = nnx.Embed(vocab_size, embed_dim, rngs=rngs, embedding_init=embed_init)
+        self.pos_embed = nnx.Embed(
+            hidden_size, embed_dim, rngs=rngs, embedding_init=embed_init
+        )
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
         decoder_layers = [DecoderBlock(rngs=rngs) for _ in range(n_layers)]
         self.decoder_layers = nnx.Sequential(*decoder_layers)
         self.lm_head = nnx.Linear(embed_dim, vocab_size, rngs=rngs)
 
     def __call__(self, x_tokens: jax.Array) -> jax.Array:
-        b_size, token_len, _ = x_tokens.shape
+        b_size, token_len = x_tokens.shape
         pos = jnp.arange(0, token_len, device=x_tokens.device, dtype=jnp.int64)
         token_embed = self.wtoken_embed(x_tokens.astype(jnp.int64))
         pos_embed = self.pos_embed(pos)
@@ -163,10 +166,10 @@ class Transformer(nnx.Module):
         x = token_embed + pos_embed
 
         x = self.layernorm(self.decoder_layers(x_tokens))
-        print(f"decoder out shape => {x.shape}")
 
         x = self.lm_head(x)
         output = nnx.softmax(x, axis=1)
+
         print(f"lm/softmax out shape => {output.shape}")
 
         return output
@@ -177,7 +180,6 @@ class Transformer(nnx.Module):
 
 slm_model = Transformer(n_layers, embed_dim, rngs=nnx.Rngs(3))
 # nnx.display(slm_model)
-
 s = slm_model(jnp.ones((1, 20, 768)))
 print(s.shape)
 
