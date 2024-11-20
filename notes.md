@@ -7,3 +7,11 @@ But after using it personally and seeing how good it was, the control, the syner
  how it adapted to different environments and devices, etc, I fell in love more.
 
 Yes, it is not widely used as Pytorch(this even makes it feel better), but it is flexible and all.
+
+Also, for stuff I wanna train with Google's TRC grants,
+ I will need JAX, def not Pytorch on TPUs.
+ 
+##### stuff I ported to Jax
+- tiny GPT transformer
+- Mobilenet
+- Rectified flow(mmdit next)
