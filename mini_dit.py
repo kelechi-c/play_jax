@@ -500,10 +500,10 @@ class DiTBackbone(nnx.Module):
 
         return x
 
-    def cfg_forward(self, x_img, t, y_cond, cfg_scale):
+    def cfg_forward(self, x_img, y_cond, cfg_scale):
         half = x_img[: len(x_img) // 2]
         combined = jnp.concat([half, half], axis=0)
-        model_out = self.__call__(combined, t, y_cond)
+        model_out = self(combined, y_cond)
 
         eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = jnp.split(eps, len(eps) // 2, axis=0)
