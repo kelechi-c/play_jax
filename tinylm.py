@@ -1,27 +1,45 @@
-import jax, math, optax, wandb, click, time, gc
+import jax, math, optax
 from jax import numpy as jnp, random as jrand, Array
+from jax.sharding import NamedSharding, Mesh, PartitionSpec as PS
+from jax.experimental import mesh_utils
 from flax import nnx
-from einops import rearrange
+
+import wandb, click, time, gc, os
 from tqdm.auto import tqdm
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
 from torch.utils.data import DataLoader, IterableDataset
 
+
+jax.config.update("jax_default_matmul_precision", "bfloat16")
+JAX_TRACEBACK_FILTERING = "off"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+XLA_PYTHON_CLIENT_MEM_FRACTION = 0.20
+JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
+
 class config:
+    depth = 12
     attn_heads = 8
     hidden_dim = 768
     mlp_dim = hidden_dim * 2
     vocab_size = 8192
-    n_layers = 12
     seed = 256
     key = jrand.key(seed)
     split = 10000
     learn_rate = 1e-4
 
-randkey = config.key
 
-# confirm devices
-print(f"JAX devices: {jax.local_devices()}")
+num_devices = jax.device_count()
+devices = jax.devices()
+
+print(f"found {num_devices} JAX device(s)")
+for device in devices:
+    print(f"{device} / ")
+
+mesh_devices = mesh_utils.create_device_mesh((num_devices,))
+mesh = Mesh(mesh_devices, axis_names="data")
+data_sharding = NamedSharding(mesh, PS("data"))
 
 hfdata = load_dataset("roneneldan/TinyStories", split="train", streaming=True).take(config.split)
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -69,6 +87,7 @@ def jax_collate(batch):
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0.0)
 normal_init = nnx.initializers.normal(0.02)
+randkey = config.key
 
 
 class MLP(nnx.Module):
@@ -268,8 +287,8 @@ def trainer(epochs, model, optimizer, train_loader):
 @click.option("-e", "--epochs", default=30)
 @click.option("-bs", "--batch_size", default=32)
 def main(run, epochs, batch_size):
-    embed_dim = 512
-    depth = 8
+    embed_dim = config.hidden_dim
+    depth = config.depth
 
     textdata = TextData()
     train_loader = DataLoader(textdata, batch_size=batch_size, collate_fn=jax_collate)
@@ -290,9 +309,6 @@ def main(run, epochs, batch_size):
     state = nnx.state((model, optimizer))
     state = jax.device_put(state, jax.devices()[0])
     nnx.update((model, optimizer), state)
-
-    sp = next(iter(train_loader))
-    print(f"loaded data \n data sample: {sp['vae_output'].shape}")
 
     if run == "single_batch":
         model, loss = batch_trainer(
