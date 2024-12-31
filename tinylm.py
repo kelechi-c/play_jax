@@ -58,7 +58,7 @@ class TextData(IterableDataset):
             tokens = tokenizer(
                 sample["text"],
                 truncation=True,
-                return_temsors="np",
+                return_tensors="np",
                 padding="max_length",
                 max_length=128,
             )
