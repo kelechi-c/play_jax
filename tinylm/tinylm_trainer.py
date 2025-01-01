@@ -4,6 +4,7 @@ from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 from flax import nnx
 
+import numpy as np
 import wandb, click, time, gc, os, pickle
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
@@ -87,6 +88,22 @@ zero_init = nnx.initializers.constant(0.0)
 normal_init = nnx.initializers.normal(0.02)
 randkey = config.key
 
+def sinusoidal_init(max_len=128, min_scale=1.0, max_scale=10000.0):
+
+  def init(key, shape, dtype=np.float32):
+    """Sinusoidal init."""
+    del key, dtype
+    d_feature = shape[-1]
+    pe = np.zeros((max_len, d_feature), dtype=np.float32)
+    position = np.arange(0, max_len)[:, np.newaxis]
+    scale_factor = -np.log(max_scale / min_scale) / (d_feature // 2 - 1)
+    div_term = min_scale * np.exp(np.arange(0, d_feature // 2) * scale_factor)
+    pe[:, : d_feature // 2] = np.sin(position * div_term)
+    pe[:, d_feature // 2 : 2 * (d_feature // 2)] = np.cos(position * div_term)
+    pe = pe[np.newaxis, :, :]  # [1, max_len, d_feature]
+    return jnp.array(pe)
+
+  return init
 
 class MLP(nnx.Module):
     def __init__(self, embed_dim, rngs: nnx.Rngs):
@@ -125,6 +142,8 @@ class DecoderBlock(nnx.Module):
             dtype=jnp.bfloat16,
             decode=True,
             rngs=rngs,
+            kernel_init=xavier_init,
+            bias_init=zero_init
         )
         self.ffn_layer = MLP(embed_dim, rngs=rngs)
 
@@ -142,12 +161,12 @@ class Transformer(nnx.Module):
         super().__init__()
         embed_init = nnx.initializers.normal(0.02)
 
-        self.wtoken_embed = nnx.Embed(
-            vocab_size, embed_dim, rngs=rngs, embedding_init=embed_init
-        )
-        self.pos_embed = nnx.Param(
-            1, config.max_len, embed_dim, rngs=rngs, embedding_init=embed_init
-        )
+        self.wtoken_embed = nnx.Embed(vocab_size, embed_dim, rngs=rngs, embedding_init=embed_init)
+        self.posembed_shape = (1, config.max_len, embed_dim)
+        
+        pe_value = sinusoidal_init(max_len=config.max_len)(None, self.posembed_shape)
+        self.pos_embed = nnx.Param(pe_value, rngs=rngs)
+        jax.lax.stop_gradient(self.pos_embed.value)
 
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs, epsilon=1e-6)
 
@@ -162,12 +181,8 @@ class Transformer(nnx.Module):
         )
 
     def __call__(self, x_tokens: jax.Array) -> jax.Array:
-        b_size, token_len = x_tokens.shape
-        pos = jnp.arange(0, token_len, device=x_tokens.device, dtype=jnp.int32)
         token_embed = self.wtoken_embed(x_tokens.astype(jnp.int32))
-        pos_embed = self.pos_embed(pos)
-
-        x = token_embed + pos_embed
+        x = token_embed + self.pos_embed.value
 
         for block in self.decoder_layers:
             x = block(x)
@@ -207,13 +222,9 @@ def load_paramdict_pickle(model, filename="model.pkl"):
     with open(filename, "rb") as modelfile:
         params = pickle.load(modelfile)
 
-    # print(type(params))
     params = unfreeze(params)
-    # print(type(params))
     params = flax.traverse_util.unflatten_dict(params, sep=".")
-    # print(type(params))
     params = from_state_dict(model, params)
-    # print(type(params), type(model))
 
     nnx.update(model, params)
 
@@ -270,10 +281,10 @@ def modelpass(logits, tokens):
 
 
 # compile multidevice versions of train/eval/predict step fn.
-model = Transformer(n_layers=6, embed_dim=256, rngs=nnx.Rngs(config.seed))
+lm_model = Transformer(n_layers=6, embed_dim=256, rngs=nnx.Rngs(config.seed))
 tx_optimizer = optax.adamw(learning_rate=1e-4)
 
-state, state_sharding = initialize_state(model, mesh, tx_optimizer)
+state, state_sharding = initialize_state(lm_model, mesh, tx_optimizer)
 data_sharding = NS(mesh, PS("data"))
 rep_sharding = NS(mesh, PS())
 
@@ -387,24 +398,21 @@ def trainer(epochs, model, train_loader):
 @click.option("-bs", "--batch_size", default=32)
 def main(run, epochs, batch_size):
     embed_dim = config.hidden_dim
-    depth = config.depth
-
+    
     textdata = TextData()
     train_loader = DataLoader(textdata, batch_size=batch_size, collate_fn=jax_collate)
 
     vs = next(iter(train_loader))
     print(f"sample token shape: {vs['input_ids'].shape}")
 
-    model = Transformer(depth, embed_dim, rngs=nnx.Rngs(config.seed))
-
-    testout = model(jnp.ones((1, 64, embed_dim)))
+    testout = lm_model(jnp.ones((1, 128, embed_dim)))
     print(f"test output shape => {testout.shape}")
 
-    n_params = sum([p.size for p in jax.tree.leaves(nnx.state(model))])
+    n_params = sum([p.size for p in jax.tree.leaves(nnx.state(lm_model))])
     print(f"model parameters count: {n_params/1e6:.2f}M, ")
 
     if run == "single_batch":
-        model, loss = batch_trainer(epochs, model=model, train_loader=train_loader)
+        model, loss = batch_trainer(epochs, model=lm_model, train_loader=train_loader)
         wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
 
