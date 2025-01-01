@@ -1,0 +1,415 @@
+import jax, math, optax
+from jax import numpy as jnp, random as jrand, Array
+from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
+from jax.experimental import mesh_utils
+from flax import nnx
+
+import wandb, click, time, gc, os, pickle
+from datasets import load_dataset
+from transformers import GPT2Tokenizer
+from torch.utils.data import DataLoader, IterableDataset
+from tqdm.auto import tqdm
+from functools import partial
+from flax.training.train_state import TrainState
+import flax.traverse_util
+from flax.serialization import to_state_dict, from_state_dict
+from flax.core import freeze, unfreeze
+
+jax.distributed.initialize()
+jax.config.update("jax_default_matmul_precision", "bfloat16")
+JAX_TRACEBACK_FILTERING = "off"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+XLA_PYTHON_CLIENT_MEM_FRACTION = 0.20
+JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
+
+
+class config:
+    depth = 12
+    attn_heads = 8
+    hidden_dim = 768
+    mlp_dim = hidden_dim * 2
+    vocab_size = 2048
+    max_len = 128
+    seed = 256
+    key = jrand.key(seed)
+    split = 10_000
+    learn_rate = 1e-4
+
+
+num_devices = jax.device_count()
+devices = jax.devices()
+
+print(f"found {num_devices} JAX device(s)")
+for device in devices:
+    print(f"{device} / \n")
+
+
+mesh_devices = mesh_utils.create_device_mesh((num_devices,))
+mesh = Mesh(mesh_devices, axis_names=("data", None))
+print(f"{mesh.shape = }")
+
+
+hfdata = load_dataset("roneneldan/TinyStories", split="train", streaming=True).take(
+    config.split
+)
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+
+class TextData(IterableDataset):
+    def __init__(self, dataset=hfdata):
+        super().__init__()
+        self.dataset = dataset
+
+    def __len__(self):
+        return split
+
+    def __iter__(self):
+        for sample in self.dataset:
+            tokens = tokenizer(
+                sample["text"],
+                truncation=True,
+                return_tensors="np",
+                padding="max_length",
+                max_length=128,
+            )
+
+            token_ids = tokens["input_ids"]
+            attn_mask = tokens["attention_mask"]
+
+            tokens, attn_mask = jnp.array(token_ids), jnp.array(attn_mask)
+
+            yield {"input_ids": tokens, "attention_mask": attn_mask}
+
+
+xavier_init = nnx.initializers.xavier_uniform()
+zero_init = nnx.initializers.constant(0.0)
+normal_init = nnx.initializers.normal(0.02)
+randkey = config.key
+
+
+class MLP(nnx.Module):
+    def __init__(self, embed_dim, rngs: nnx.Rngs):
+        super().__init__()
+        self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
+        self.linear1 = nnx.Linear(
+            embed_dim,
+            2 * embed_dim,
+            rngs=rngs,
+            kernel_init=xavier_init,
+            bias_init=zero_init,
+        )
+        self.linear2 = nnx.Linear(
+            2 * embed_dim,
+            embed_dim,
+            rngs=rngs,
+            kernel_init=xavier_init,
+            bias_init=zero_init,
+        )
+
+    def __call__(self, x_input: jax.Array) -> jax.Array:
+        x = self.layernorm(x_input)
+        x = nnx.silu(self.linear1(x))
+        x = self.linear2(x)
+
+        return x
+
+
+class DecoderBlock(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs, embed_dim=512, attn_heads=8):
+        super().__init__()
+        self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
+        self.attention = nnx.MultiHeadAttention(
+            num_heads=attn_heads,
+            in_features=embed_dim,
+            dtype=jnp.bfloat16,
+            decode=True,
+            rngs=rngs,
+        )
+        self.ffn_layer = MLP(embed_dim, rngs=rngs)
+
+    def __call__(self, x_token: Array) -> Array:
+        x = x_token + self.layernorm(self.attention(x_token))
+        x = x + self.layernorm(self.ffn_layer(x))
+        return x
+
+
+# autoregressive transformer block, or just an SLM
+class Transformer(nnx.Module):
+    def __init__(
+        self, n_layers, embed_dim, rngs: nnx.Rngs, vocab_size=config.vocab_size, config=config
+    ):
+        super().__init__()
+        embed_init = nnx.initializers.normal(0.02)
+
+        self.wtoken_embed = nnx.Embed(
+            vocab_size, embed_dim, rngs=rngs, embedding_init=embed_init
+        )
+        self.pos_embed = nnx.Param(
+            1, config.max_len, embed_dim, rngs=rngs, embedding_init=embed_init
+        )
+
+        self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs, epsilon=1e-6)
+
+        self.decoder_layers = [DecoderBlock(rngs=rngs) for _ in range(n_layers)]
+        # self.decoder_layers = nnx.Sequential(*decoder_layers)
+        self.linear_head = nnx.Linear(
+            embed_dim,
+            vocab_size,
+            rngs=rngs,
+            kernel_init=xavier_init,
+            bias_init=zero_init,
+        )
+
+    def __call__(self, x_tokens: jax.Array) -> jax.Array:
+        b_size, token_len = x_tokens.shape
+        pos = jnp.arange(0, token_len, device=x_tokens.device, dtype=jnp.int32)
+        token_embed = self.wtoken_embed(x_tokens.astype(jnp.int32))
+        pos_embed = self.pos_embed(pos)
+
+        x = token_embed + pos_embed
+
+        for block in self.decoder_layers:
+            x = block(x)
+
+        x = self.layernorm(x)
+        x = self.linear_head(x)
+
+        return x
+
+    def generate(self, cond_token, max_outlen=128, temperature=1):
+        pass
+
+
+def _to_jax_array(x):
+    if not isinstance(x, jax.Array):
+        x = jnp.asarray(x)
+    return x
+
+
+# save model params in pickle file
+def save_paramdict_pickle(model, filename="model.pkl"):
+    params = nnx.state(model)
+    params = jax.device_get(params)
+
+    state_dict = to_state_dict(params)
+    frozen_state_dict = freeze(state_dict)
+
+    flat_state_dict = flax.traverse_util.flatten_dict(frozen_state_dict, sep=".")
+
+    with open(filename, "wb") as f:
+        pickle.dump(frozen_state_dict, f)
+
+    return flat_state_dict
+
+
+def load_paramdict_pickle(model, filename="model.pkl"):
+    with open(filename, "rb") as modelfile:
+        params = pickle.load(modelfile)
+
+    # print(type(params))
+    params = unfreeze(params)
+    # print(type(params))
+    params = flax.traverse_util.unflatten_dict(params, sep=".")
+    # print(type(params))
+    params = from_state_dict(model, params)
+    # print(type(params), type(model))
+
+    nnx.update(model, params)
+
+    return model, params
+
+
+def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
+    # initilaize wandb
+    wandb.login(key=key)
+    wandb.init(project=project_name, name=run_name or None)
+
+
+def initialize_state(model: nnx.Module, mesh, optimizer):
+    with mesh:
+        graphdef, params = nnx.split(model, nnx.Param)
+        state = TrainState.create(
+            apply_fn=graphdef.apply, params=params, tx=optimizer, graphdef=graphdef
+        )
+        state = jax.tree.map(_to_jax_array, state)
+        state_spec = nnx.get_partition_spec(state)
+        state = jax.lax.with_sharding_constraint(state, state_spec)
+
+    state_sharding = nnx.get_named_sharding(state, mesh)
+    return state, state_sharding
+
+
+def jax_collate(batch):
+    tokens = jnp.stack(
+        [jnp.array(item["input_ids"], dtype=jnp.bfloat16) for item in batch], axis=0
+    )
+    mask = jnp.stack(
+        [jnp.array(item["attention_mask"], dtype=jnp.bfloat16) for item in batch],
+        axis=0,
+    )
+
+    return {
+        "input_ids": tokens,
+        "attention_mask": mask,
+    }
+
+
+def modelpass(logits, tokens):
+
+    output = logits[..., :-1, :]
+    targets = tokens[..., 1:].squeeze(1)
+
+    output = output.reshape(-1, output.shape[-1])
+    targets = targets.reshape(-1)
+
+    output = output.astype(jnp.bfloat16)
+    targets = targets.astype(jnp.bfloat16)
+
+    return output, targets
+
+
+# compile multidevice versions of train/eval/predict step fn.
+model = Transformer(n_layers=6, embed_dim=256, rngs=nnx.Rngs(config.seed))
+tx_optimizer = optax.adamw(learning_rate=1e-4)
+
+state, state_sharding = initialize_state(model, mesh, tx_optimizer)
+data_sharding = NS(mesh, PS("data"))
+rep_sharding = NS(mesh, PS())
+
+
+@partial(
+    jax.jit,
+    in_shardings=(state_sharding, data_sharding),  # type: ignore
+    out_shardings=(state_sharding, None),  # type: ignore
+    # static_argnums=(2, 3),
+    donate_argnums=0,
+)  # type: ignore
+def train_step(model_state, batch):
+
+    def loss_func(state, batch):
+        model = nnx.merge(state.graphdef, state)
+
+        tokens = batch["input_ids"]
+        logits = model(tokens)
+
+        logits = logits.astype(jnp.bfloat16)
+        tokens = tokens.astype(jnp.bfloat16)
+        output, targets = modelpass(logits, tokens)
+
+        loss = optax.softmax_cross_entropy(output, targets).mean()
+
+        return loss
+
+    grad_fn = jax.value_and_grad(loss_func)
+    loss, grads = grad_fn(model_state.params, batch)
+    new_state = model_state.apply_gradients(grads=grads)
+
+    return new_state, loss
+
+
+jit_train_step = jax.jit(
+    train_step,
+    in_shardings=(
+        state_sharding,
+        data_sharding,
+        None,
+    ),  # type: ignore
+    out_shardings=(state_sharding),  # type: ignore
+    static_argnums=(2, 3),
+    donate_argnums=0,
+)
+
+
+def batch_trainer(epochs, model, train_loader):
+    train_loss = 0.0
+    model.train()
+
+    wandb_logger(key="", project_name="tinylm_jax")
+
+    stime = time.time()
+
+    batch = next(iter(train_loader))
+    print("start overfitting.../")
+
+    for epoch in tqdm(range(epochs)):
+        train_loss = train_step(model, batch)
+        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
+        wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss)})
+
+        if epoch % 50 == 0:
+            pass
+
+        jax.clear_caches()
+        jax.clear_backends()
+        gc.collect()
+
+    etime = time.time() - stime
+    print(
+        f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
+    )
+
+    return model, train_loss
+
+
+def trainer(epochs, model, train_loader):
+    train_loss = 0.0
+    model.train()
+
+    wandb_logger(key="", project_name="tinylm_jax")
+    stime = time.time()
+
+    print("start overfitting.../")
+
+    for epoch in tqdm(range(epochs)):
+        for step, batch in tqdm(enumerate(train_loader)):
+            train_loss = train_step(model, batch)
+            print(f"step {step}/{len(train_loader)}, train loss => {train_loss:.4f}")
+            wandb.log({"loss": train_loss, "log_loss": math.log10(train_loss)})
+
+            if step % 200 == 0:
+                pass
+
+            jax.clear_caches()
+            jax.clear_backends()
+            gc.collect()
+
+        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss:.4f}")
+
+    etime = time.time() - stime
+    wandb.log({"train/time_mins": etime / 60})
+    print(f"train time for {epochs} epochs -> {etime/60/60:.4f} hrs")
+
+
+@click.command()
+@click.option("-r", "--run", default="single_batch")
+@click.option("-e", "--epochs", default=30)
+@click.option("-bs", "--batch_size", default=32)
+def main(run, epochs, batch_size):
+    embed_dim = config.hidden_dim
+    depth = config.depth
+
+    textdata = TextData()
+    train_loader = DataLoader(textdata, batch_size=batch_size, collate_fn=jax_collate)
+
+    vs = next(iter(train_loader))
+    print(f"sample token shape: {vs['input_ids'].shape}")
+
+    model = Transformer(depth, embed_dim, rngs=nnx.Rngs(config.seed))
+
+    testout = model(jnp.ones((1, 64, embed_dim)))
+    print(f"test output shape => {testout.shape}")
+
+    n_params = sum([p.size for p in jax.tree.leaves(nnx.state(model))])
+    print(f"model parameters count: {n_params/1e6:.2f}M, ")
+
+    if run == "single_batch":
+        model, loss = batch_trainer(epochs, model=model, train_loader=train_loader)
+        wandb.finish()
+        print(f"single batch training ended at loss: {loss:.4f}")
+
+    elif run == "train":
+        print(f"you missed your train looop impl boy")
+
+
+main()
