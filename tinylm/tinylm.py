@@ -4,7 +4,6 @@ from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 from flax import nnx
 
-import wandb, click, time, gc, os
 from tqdm.auto import tqdm
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
@@ -29,18 +28,6 @@ class config:
     split = 10000
     learn_rate = 1e-4
 
-
-num_devices = jax.device_count()
-devices = jax.devices()
-
-print(f"found {num_devices} JAX device(s)")
-for device in devices:
-    print(f"{device} / ")
-
-mesh_devices = mesh_utils.create_device_mesh((num_devices,))
-mesh = Mesh(mesh_devices, axis_names="data")
-data_sharding = NS(mesh, PS("data"))
-rep_sharding =NS(mesh, PS()) 
 
 hfdata = load_dataset("roneneldan/TinyStories", split="train", streaming=True).take(config.split)
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -70,19 +57,6 @@ class TextData(IterableDataset):
             tokens, attn_mask = jnp.array(token_ids), jnp.array(attn_mask)
 
             yield {"input_ids": tokens, "attention_mask": attn_mask}
-
-
-def jax_collate(batch):
-    tokens = jnp.stack([jnp.array(item["input_ids"], dtype=jnp.bfloat16) for item in batch], axis=0)
-    mask = jnp.stack(
-        [jnp.array(item["attention_mask"], dtype=jnp.bfloat16) for item in batch],
-        axis=0,
-    )
-
-    return {
-        "input_ids": tokens,
-        "attention_mask": mask,
-    }
 
 
 xavier_init = nnx.initializers.xavier_uniform()
@@ -139,6 +113,7 @@ class Transformer(nnx.Module):
     ):
         super().__init__()
         embed_init = nnx.initializers.normal(0.02)
+        
         self.wtoken_embed = nnx.Embed(
             vocab_size, embed_dim, rngs=rngs, embedding_init=embed_init
         )
@@ -160,8 +135,8 @@ class Transformer(nnx.Module):
 
     def __call__(self, x_tokens: jax.Array) -> jax.Array:
         b_size, token_len = x_tokens.shape
-        pos = jnp.arange(0, token_len, device=x_tokens.device, dtype=jnp.int64)
-        token_embed = self.wtoken_embed(x_tokens.astype(jnp.int64))
+        pos = jnp.arange(0, token_len, device=x_tokens.device, dtype=jnp.int32)
+        token_embed = self.wtoken_embed(x_tokens.astype(jnp.int32))
         pos_embed = self.pos_embed(pos)
 
         x = token_embed + pos_embed
@@ -170,10 +145,7 @@ class Transformer(nnx.Module):
             x = block(x)
 
         x = self.layernorm(x)
-
         x = self.linear_head(x)
-        # output = nnx.softmax(x, axis=1)
-        print(f"lm out shape => {x.shape}")
 
         return x
 
