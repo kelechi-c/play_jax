@@ -1,14 +1,17 @@
 import jax, math, optax
-from jax import numpy as jnp, random as jrand, Array
+from jax import numpy as jnp, random as jrand
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 from flax import nnx
 
 import wandb, click, time, gc, os
 from tqdm.auto import tqdm
-from datasets import load_dataset
-from transformers import GPT2Tokenizer
-from torch.utils.data import DataLoader, IterableDataset
+from functools import partial
+from torch.utils.data import DataLoader
+
+from .tinylm import Transformer, TextData 
+from .utils import initialize_state, wandb_logger
+
 
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 JAX_TRACEBACK_FILTERING = "off"
@@ -37,17 +40,25 @@ print(f"found {num_devices} JAX device(s)")
 for device in devices:
     print(f"{device} / ")
 
+
 mesh_devices = mesh_utils.create_device_mesh((num_devices,))
-mesh = Mesh(mesh_devices, axis_names="data")
-data_sharding = NS(mesh, PS("data"))
-rep_sharding =NS(mesh, PS()) 
+mesh = Mesh(mesh_devices, axis_names=("data", None))
+print(f'{mesh.shape = }')
 
 
-def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
-    # initilaize wandb
-    wandb.login(key=key)
-    wandb.init(project=project_name, name=run_name or None)
+def jax_collate(batch):
+    tokens = jnp.stack(
+        [jnp.array(item["input_ids"], dtype=jnp.bfloat16) for item in batch], axis=0
+    )
+    mask = jnp.stack(
+        [jnp.array(item["attention_mask"], dtype=jnp.bfloat16) for item in batch],
+        axis=0,
+    )
 
+    return {
+        "input_ids": tokens,
+        "attention_mask": mask,
+    }
 
 def modelpass(logits, tokens):
 
@@ -63,30 +74,61 @@ def modelpass(logits, tokens):
     return output, targets
 
 
-def loss_func(model, batch):
-    tokens = batch["input_ids"]
-    logits = model(tokens)
+# compile multidevice versions of train/eval/predict step fn.
+model = Transformer(n_layers=6, embed_dim=256, rngs=nnx.Rngs(config.seed))
+tx_optimizer = optax.adamw(learning_rate=1e-4)
 
-    logits = logits.astype(jnp.float32)
-    tokens = tokens.astype(jnp.float32)
+state, state_sharding = initialize_state(model, mesh, tx_optimizer)
+data_sharding = NS(mesh, PS("data"))
+rep_sharding = NS(mesh, PS())
 
-    output, targets = modelpass(logits, tokens)
+@partial(
+    jax.jit,
+    in_shardings=(
+        state_sharding,
+        data_sharding
+    ),  # type: ignore
+    out_shardings=(state_sharding, None),  # type: ignore
+    # static_argnums=(2, 3),
+    donate_argnums=0,
+)  # type: ignore
+def train_step(model_state, batch):
 
-    loss = optax.softmax_cross_entropy(output, targets).mean()
+    def loss_func(state, batch):
+        model = nnx.merge(state.graphdef, state)
+        
+        tokens = batch["input_ids"]
+        logits = model(tokens)
 
-    return loss, logits
+        logits = logits.astype(jnp.bfloat16)
+        tokens = tokens.astype(jnp.bfloat16)
+        output, targets = modelpass(logits, tokens)
+
+        loss = optax.softmax_cross_entropy(output, targets).mean()
+
+        return loss
+
+    grad_fn = jax.value_and_grad(loss_func)
+    loss, grads = grad_fn(model_state.params, batch)
+    new_state = model_state.apply_gradients(grads=grads)
+
+    return new_state, loss
 
 
-@nnx.jit
-def train_step(model, optimizer, batch):
-    gradfn = nnx.value_and_grad(loss_func, has_aux=True)
-    (loss, logits), grads = gradfn(model, batch)
-    optimizer.update(grads)
+jit_train_step = jax.jit(
+    train_step,
+    in_shardings=(
+        state_sharding,
+        data_sharding,
+        None,
+    ),  # type: ignore
+    out_shardings=(state_sharding),  # type: ignore
+    static_argnums=(2, 3),
+    donate_argnums=0,
+)
 
-    return loss
 
-
-def batch_trainer(epochs, model, optimizer, train_loader):
+def batch_trainer(epochs, model, train_loader):
     train_loss = 0.0
     model.train()
 
@@ -98,7 +140,7 @@ def batch_trainer(epochs, model, optimizer, train_loader):
     print("start overfitting.../")
 
     for epoch in tqdm(range(epochs)):
-        train_loss = train_step(model, optimizer, batch)
+        train_loss = train_step(model, batch)
         print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
         wandb.log({"loss": train_loss, "log_loss": math.log10(train_loss)})
 
@@ -122,7 +164,6 @@ def trainer(epochs, model, optimizer, train_loader):
     model.train()
 
     wandb_logger(key="", project_name="tinylm_jax")
-
     stime = time.time()
 
     print("start overfitting.../")
@@ -130,17 +171,20 @@ def trainer(epochs, model, optimizer, train_loader):
     for epoch in tqdm(range(epochs)):
         for step, batch in tqdm(enumerate(train_loader)):
             train_loss = train_step(model, optimizer, batch)
-            print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss:.4f}")
+            print(f"step {step}/{len(train_loader)}, train loss => {train_loss:.4f}")
             wandb.log({"loss": train_loss, "log_loss": math.log10(train_loss)})
 
-            if epoch % 200 == 0:
+            if step % 200 == 0:
                 pass
 
             jax.clear_caches()
             jax.clear_backends()
             gc.collect()
 
+        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss:.4f}")
+
     etime = time.time() - stime
+    wandb.log({'train/time_mins': etime/60})
     print(f"train time for {epochs} epochs -> {etime/60/60:.4f} hrs")
 
 
@@ -174,7 +218,7 @@ def main(run, epochs, batch_size):
 
     if run == "single_batch":
         model, loss = batch_trainer(
-            epochs, model=model, optimizer=optimizer, train_loader=train_loader
+            epochs, model=model, train_loader=train_loader
         )
         wandb.finish()
         print(f"single batch training ended at loss: {loss:.4f}")
