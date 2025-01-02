@@ -51,19 +51,19 @@ mesh = Mesh(mesh_devices, axis_names=("data", None))
 print(f"{mesh.shape = }")
 
 
-hfdata = load_dataset("roneneldan/TinyStories", split="train", streaming=True).take(
-    config.split
-)
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
 
 class TextData(IterableDataset):
-    def __init__(self, dataset=hfdata):
+    def __init__(self, split=128):
         super().__init__()
-        self.dataset = dataset
+        self.split = split
+        self.dataset = load_dataset(
+            "neuralwork/arxiver", split="train", streaming=True
+        ).take(self.split)
 
     def __len__(self):
-        return split
+        return self.split
 
     def __iter__(self):
         for sample in self.dataset:
@@ -266,8 +266,8 @@ def jax_collate(batch):
     }
 
 
+@jax.vmap
 def modelpass(logits, tokens):
-
     output = logits[..., :-1, :]
     targets = tokens[..., 1:].squeeze(1)
 
