@@ -7,7 +7,7 @@ from flax import nnx
 import numpy as np
 import wandb, click, time, gc, os, pickle
 from datasets import load_dataset
-from transformers import GPT2Tokenizer
+from transformers import GPT2Tokenizer, AutoTokenizer
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
 from functools import partial
@@ -15,9 +15,11 @@ from flax.training import train_state
 import flax.traverse_util
 from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
+import warnings
 
+# warnings.filter('ignore')
 jax.distributed.initialize()
-# jax.config.update("jax_default_matmul_precision", "bfloat16")
+jax.config.update("jax_default_matmul_precision", "bfloat16")
 JAX_TRACEBACK_FILTERING = "off"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
@@ -30,7 +32,7 @@ class config:
     attn_heads = 8
     hidden_dim = 256
     mlp_dim = hidden_dim * 2
-    vocab_size = 2048
+    vocab_size = 50_257 #GPT2Tokenizer.vocab_size
     max_len = 128
     seed = 256
     key = jrand.key(seed)
@@ -53,8 +55,8 @@ print(f"{mesh.shape = }")
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
-
-print("loaded tokenizer")
+print(tokenizer.bos_token_id)
+print(f'loaded tokenizer, vocab_size = {tokenizer.vocab_size}')
 
 
 class TextData(IterableDataset):
@@ -172,7 +174,6 @@ class Transformer(nnx.Module):
         config=config,
     ):
         super().__init__()
-        embed_init = nnx.initializers.normal(stddev=1.0)
 
         self.wtoken_embed = nnx.Embed(
             num_embeddings=config.vocab_size,
@@ -180,7 +181,7 @@ class Transformer(nnx.Module):
             embedding_init=nnx.initializers.normal(stddev=1.0),
             rngs=rngs,
         )
-        print(f"embed state {nnx.state(self.wtoken_embed)}")
+        # print(f"embed state {nnx.state(self.wtoken_embed)}")
 
         self.posembed_shape = (1, config.max_len, embed_dim)
 
@@ -192,10 +193,7 @@ class Transformer(nnx.Module):
             embed_dim, rngs=rngs, epsilon=1e-6, scale_init=nnx.initializers.ones_init()
         )
 
-        self.decoder_layers = [
-            DecoderBlock(rngs=rngs, embed_dim=embed_dim, attn_heads=attn_heads)
-            for _ in range(n_layers)
-        ]
+        self.decoder_layers = [DecoderBlock(rngs=rngs, embed_dim=embed_dim, attn_heads=attn_heads) for _ in range(n_layers)]
         # self.decoder_layers = nnx.Sequential(*decoder_layers)
         self.linear_head = nnx.Linear(
             embed_dim,
@@ -206,23 +204,23 @@ class Transformer(nnx.Module):
         )
 
     def __call__(self, x_tokens: jax.Array) -> jax.Array:
-        print(f"input {x_tokens}")
+        # print(f'input {x_tokens}')
         token_embed = self.wtoken_embed(x_tokens)
 
-        print(f"after token embed {token_embed}")
+        # print(f"after token embed {token_embed}")
 
         x = token_embed + self.pos_embed.value
-        print(f"after pos add {x}")
+        # print(f'after pos add {x}')
         for block in self.decoder_layers:
             x = block(x)
 
-        print(f"after decoder blocks {x}")
+        # print(f'after decoder blocks {x}')
 
         x = self.layernorm(x)
-        print(f"before linear head {x}")
+        # print(f"before linear head {x}")
 
         x = self.linear_head(x)
-        print(f"model out {x}")
+        # print(f'model logits {x}')
 
         return x
 
@@ -274,7 +272,6 @@ def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
 class TrainState(train_state.TrainState):
     graphdef: nnx.GraphDef[Transformer]
 
-
 def initialize_state(model: nnx.Module, mesh, optimizer):
     with mesh:
         graphdef, params = nnx.split(model, nnx.Param)
@@ -290,7 +287,9 @@ def initialize_state(model: nnx.Module, mesh, optimizer):
 
 
 def jax_collate(batch):
-    tokens = jnp.stack([jnp.array(item["input_ids"]) for item in batch], axis=0)
+    tokens = jnp.stack(
+        [jnp.array(item["input_ids"]) for item in batch], axis=0
+    )
     mask = jnp.stack(
         [jnp.array(item["attention_mask"]) for item in batch],
         axis=0,
@@ -310,9 +309,8 @@ def modelpass(logits, tokens):
     targets = tokens.squeeze(1)[..., 1:]
 
     output = output.reshape(-1, output.shape[-1])
-    targets = jnp.expand_dims(targets.reshape(-1), axis=-1)  # jnp.expand_dims(axis=-1)
+    targets = jnp.expand_dims(targets.reshape(-1), axis=-1) #jnp.expand_dims(axis=-1)
 
-    # print(f'{targets.shape = } / {output.shape = }')
     output = output.astype(jnp.bfloat16)
     targets = targets.astype(jnp.int32)
     # print(f'outputs {output} \n\n targets {targets}')
@@ -321,10 +319,8 @@ def modelpass(logits, tokens):
 
 
 # compile multidevice versions of train/eval/predict step fn.
-lm_model = Transformer(
-    n_layers=12, embed_dim=768, attn_heads=12, rngs=nnx.Rngs(config.seed)
-)
-tx_optimizer = optax.adamw(learning_rate=1e-5)
+lm_model = Transformer(n_layers=6, embed_dim=768, attn_heads=8, rngs=nnx.Rngs(config.seed))
+tx_optimizer = optax.adamw(learning_rate=1e-4)
 
 state, state_sharding = initialize_state(lm_model, mesh, tx_optimizer)
 data_sharding = NS(mesh, PS("data"))
@@ -334,10 +330,9 @@ rep_sharding = NS(mesh, PS())
 @partial(
     jax.jit,
     in_shardings=(state_sharding, data_sharding),  # type: ignore
-    out_shardings=(state_sharding, None),  # type: ignore
-    # static_argnums=(2, 3),
+    out_shardings=(state_sharding, None, None),  # type: ignore
     donate_argnums=0,
-)  # type: ignore
+)
 def train_step(model_state, batch):
 
     def loss_func(params, batch):
@@ -346,37 +341,29 @@ def train_step(model_state, batch):
         tokens = batch["input_ids"]
         logits = model(tokens)
 
-        # logits = logits.astype(jnp.bfloat16)
-        # tokens = tokens.astype(jnp.bfloat16)
         output, targets = modelpass(logits, tokens)
-        # jax.debug.print(f'outputs {output}')
-        loss = optax.softmax_cross_entropy(output, targets).mean()
+        one_hot_targets = jax.nn.one_hot(targets, num_classes=config.vocab_size).squeeze(1)
+        loss = optax.softmax_cross_entropy(output, one_hot_targets).mean()
 
-        return loss
+        bos_token_id = 50256  # gpt2 tokenizer
+        mask = one_hot_targets != bos_token_id
 
-    grad_fn = jax.value_and_grad(loss_func)
-    loss, grads = grad_fn(model_state.params, batch)
+        loss = jnp.sum(loss * mask) / jnp.sum(mask)
+
+        # print(loss)
+        return loss, logits
+
+    grad_fn = jax.value_and_grad(loss_func, has_aux=True)
+    (loss, logits), grads = grad_fn(model_state.params, batch)
     new_state = model_state.apply_gradients(grads=grads)
+    grad_norm = optax.global_norm(grads)
 
-    return new_state, loss
-
-
-# jit_train_step = jax.jit(
-#     train_step,
-#     in_shardings=(
-#         state_sharding,
-#         data_sharding,
-#         None,
-#     ),  # type: ignore
-#     out_shardings=(state_sharding),  # type: ignore
-#     static_argnums=(2, 3),
-#     donate_argnums=0,
-# )
+    return new_state, loss, grad_norm
 
 
 def batch_trainer(epochs, model_state, train_loader):
     train_loss = 0.0
-    # model.train()
+    lm_model.train()
 
     # wandb_logger(key="", project_name="tinylm_jax")
 
@@ -386,15 +373,14 @@ def batch_trainer(epochs, model_state, train_loader):
     print("start overfitting.../")
 
     for epoch in tqdm(range(epochs)):
-        model_state, train_loss = train_step(model_state, batch)
-        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss}")
-        # wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss)})
+        model_state, train_loss, grad_norm = train_step(model_state, batch)
+        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss}, grad_norm => {grad_norm}")
+        # wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss), "train/grad_norm": grad_norm})
 
         if epoch % 50 == 0:
             pass
 
         jax.clear_caches()
-        # jax.clear_backends()
         gc.collect()
 
     etime = time.time() - stime
@@ -420,7 +406,7 @@ def trainer(epochs, model_state, train_loader):
             print(f"step {step}/{len(train_loader)}, train loss => {train_loss:.4f}")
             # wandb.log({"loss": train_loss, "log_loss": math.log10(train_loss)})
 
-            if step % 200 == 0:
+            if step % 50 == 0:
                 pass
 
             jax.clear_caches()
@@ -446,21 +432,21 @@ def main(run, epochs, batch_size):
     vs = next(iter(train_loader))
     print(f"sample token shape: {vs['input_ids'].shape}")
 
-    rantoks = jrand.randint(randkey, (vs["input_ids"].shape), 1, 1000)
+    rantoks = jrand.randint(randkey, (vs['input_ids'].shape), 1, 1000)
 
-    testout = lm_model(rantoks)
+    testout = lm_model(vs["input_ids"])
     print(f"test output shape => {testout.shape}")
 
     n_params = sum([p.size for p in jax.tree.leaves(nnx.state(lm_model))])
     print(f"model parameters count: {n_params/1e6:.2f}M, ")
 
-    # if run == "single_batch":
-    #     model, loss = batch_trainer(epochs, state, train_loader=train_loader)
-    #     wandb.finish()
-    #     print(f"single batch training ended at loss: {loss:.4f}")
+    if run == "single_batch":
+        model, loss = batch_trainer(epochs, state, train_loader=train_loader)
+        wandb.finish()
+        print(f"single batch training ended at loss: {loss:.4f}")
 
-    # elif run == "train":
-    #     print(f"you missed your train looop impl boy")
+    elif run == "train":
+        print(f"you missed your train looop impl boy")
 
 
 main()
