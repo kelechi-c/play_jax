@@ -2,6 +2,7 @@ import jax, math, optax
 from jax import numpy as jnp, random as jrand, Array
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
+from jaxlib import xla_client
 from flax import nnx
 from einops import rearrange
 import numpy as np
@@ -12,15 +13,16 @@ from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
 from functools import partial
 from flax.training import train_state
-import flax.traverse_util
+import flax.traverse_util, builtins
 from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
-import warnings
-
-import wandb.data_types
+from pprint import pprint
+import orbax.checkpoint as ocp
 
 # warnings.filter('ignore')
 jax.distributed.initialize()
+builtins.bfloat16 = xla_client.bfloat16
+
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 JAX_TRACEBACK_FILTERING = "off"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -32,7 +34,7 @@ JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
 class config:
     depth = 12
     attn_heads = 8
-    hidden_dim = 256
+    hidden_dim = 768
     mlp_dim = hidden_dim * 2
     vocab_size = 50_257  # GPT2Tokenizer.vocab_size
     max_len = 128
@@ -40,6 +42,9 @@ class config:
     key = jrand.key(seed)
     split = 10_000
     learn_rate = 1e-5
+    save_steps = 1000
+    save_period = 5000
+    checkdir = 'checkpoints'
 
 
 num_devices = jax.device_count()
@@ -61,6 +66,18 @@ tokenizer.pad_token = tokenizer.eos_token
 print(tokenizer.bos_token_id)
 print(f"loaded tokenizer, vocab_size = {tokenizer.vocab_size}")
 
+with jax.transfer_guard("allow"):
+    options = ocp.CheckpointManagerOptions(
+        save_interval_steps=config.save_steps,
+        max_to_keep=1,
+        keep_period=config.save_period,  # milestones
+        create=True,
+        cleanup_tmp_directories=True,
+    )
+    async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler())
+    async_checkpoint_manager = ocp.CheckpointManager(
+        config.checkdir + "/tinylm", async_checkpointer, options
+    )
 
 def write_note(note: str):
     if jax.process_index() == 0:
@@ -367,7 +384,7 @@ def ar_gen(model, tokenizer=tokenizer):
     )
 
     generated_text = tokenizer.decode(generated_tokens)
-    print(f"Input: {initial_prompt} \n Generated text: {generated_text}")
+    write_note(f"Input: {initial_prompt} \n Generated text: {generated_text}")
 
     return generated_text
 
@@ -471,6 +488,9 @@ state, state_sharding = initialize_state(lm_model, mesh, tx_optimizer)
 data_sharding = NS(mesh, PS("data"))
 rep_sharding = NS(mesh, PS())
 
+print('Train_state/model sharding: ')
+pprint(state_sharding, indent=2, width=150, compact=True)
+
 
 @partial(
     jax.jit,
@@ -511,7 +531,8 @@ def batch_trainer(epochs, model_state, train_loader):
     train_loss = 0.0
     lm_model.train()
 
-    wandb_logger(key="", project_name="tinylm_jax")
+    # if rank == 0:
+    #    wandb_logger(key="", project_name="tinylm_jax")
 
     stime = time.time()
 
@@ -527,11 +548,14 @@ def batch_trainer(epochs, model_state, train_loader):
         if rank == 0:
             wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss), "train/grad_norm": grad_norm})
 
+        with jax.transfer_guard("allow"):
+            async_checkpoint_manager.save(epoch, model_state)
+
         if epoch % 50 == 0:
             write_note("sample generation...")
             pred_model = nnx.merge(model_state.graphdef, model_state.params)
             sample_text = ar_gen(pred_model)
-            
+
             if rank == 0:
                 wandb.log({"sample_text": wandb.Html(sample_text)})
 
@@ -543,6 +567,10 @@ def batch_trainer(epochs, model_state, train_loader):
         f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
     )
 
+    with jax.transfer_guard("allow"):
+        async_checkpoint_manager.save(epochs, model_state)
+        async_checkpoint_manager.wait_until_finished()
+
     return model_state, train_loss
 
 
@@ -550,7 +578,8 @@ def trainer(epochs, model_state, train_loader):
     train_loss = 0.0
     model_state.train()
 
-    # wandb_logger(key="", project_name="tinylm_jax")
+    # if rank == 0:
+        # wandb_logger(key="", project_name="tinylm_jax")
     stime = time.time()
 
     print("start training.../")
