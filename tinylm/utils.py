@@ -81,7 +81,7 @@ def generate_ar(
 ):
 
     @jax.jit
-    def predict_next_token(current_tokens, params, rng):
+    def predict_next_token(current_tokens, params, rng, top_k=2):
         # Add a batch dimension if it's not already there
         if current_tokens.ndim == 1:
             current_tokens = current_tokens[None, :]
@@ -94,7 +94,14 @@ def generate_ar(
 
         # Stochastic sampling
         probabilities = jax.nn.softmax(logits, axis=-1)
-        next_token = random.categorical(rng, probabilities)
+        if top_k > 0:
+            top_k_probs, top_k_indices = lax.top_k(probabilities, k=top_k)
+            logprobs_top_k = jnp.log(top_k_probs)
+            next_token = random.categorical(rng, logprobs_top_k)
+            next_token = top_k_indices[jnp.arange(logits.shape[0]), next_token]
+        else:
+            next_token = random.categorical(rng, jnp.log(probabilities))
+
         return next_token[0]  # Remove batch dimension
 
     all_tokens = list(initial_tokens.tolist())
