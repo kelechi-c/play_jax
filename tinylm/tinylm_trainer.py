@@ -3,7 +3,7 @@ from jax import numpy as jnp, random as jrand, Array
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 from flax import nnx
-
+from einops import rearrange
 import numpy as np
 import wandb, click, time, gc, os, pickle
 from datasets import load_dataset
@@ -16,6 +16,8 @@ import flax.traverse_util
 from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
 import warnings
+
+import wandb.data_types
 
 # warnings.filter('ignore')
 jax.distributed.initialize()
@@ -42,6 +44,7 @@ class config:
 
 num_devices = jax.device_count()
 devices = jax.devices()
+rank = jax.process_index()
 
 print(f"found {num_devices} JAX device(s)")
 for device in devices:
@@ -58,6 +61,10 @@ tokenizer.pad_token = tokenizer.eos_token
 print(tokenizer.bos_token_id)
 print(f"loaded tokenizer, vocab_size = {tokenizer.vocab_size}")
 
+
+def write_note(note: str):
+    if jax.process_index() == 0:
+        print(note)
 
 class TextData(IterableDataset):
     def __init__(self, split=128):
@@ -115,6 +122,51 @@ def sinusoidal_init(max_len=128, min_scale=1.0, max_scale=10000.0):
 
     return init
 
+class CausalSelfAttention(nnx.Module):
+    def __init__(
+        self,
+        rngs: nnx.Rngs,
+        embed_dim: int = 768,
+        attn_heads: int = 8,
+        drop=0.0,
+    ):
+        super().__init__()
+        self.attn_heads = attn_heads
+        self.embed_dim = embed_dim
+        self.head_dim = embed_dim // attn_heads
+
+        self.q_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs, kernel_init=xavier_init)
+        self.k_linear = nnx.Linear(
+            embed_dim, embed_dim, rngs=rngs, kernel_init=xavier_init
+        )
+        self.v_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs, kernel_init=xavier_init)
+
+        self.outproject = nnx.Linear(
+            embed_dim, embed_dim, rngs=rngs, kernel_init=xavier_init
+        )
+        self.dropout = nnx.Dropout(drop, rngs=rngs)
+
+    def __call__(self, x_input: jax.Array) -> jax.Array:
+        q = self.q_linear(x_input)
+        k = self.k_linear(x_input)
+        v = self.v_linear(x_input)
+
+        q, k, v = map(lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v))
+        attn_weight = q @ jnp.matrix_transpose(k)
+        attn_weight /= math.sqrt(self.head_dim)  # attention computation
+
+        b, h, l, d = q.shape  # just getting the shape, hehe
+        # causal attention mask
+        mask = jnp.tril(jnp.ones((l, l)), k=1).astype(x_input.dtype)
+        attn_logits = jnp.where(mask == 0, -jnp.inf, attn_weight)
+
+        attn_score = nnx.softmax(attn_logits, axis=-1)
+        attn_output = attn_score @ v 
+
+        output = rearrange(attn_output, "b h l d -> b l (h d)")
+        output = self.dropout(self.outproject(output))
+
+        return output
 
 class MLP(nnx.Module):
     def __init__(self, embed_dim, rngs: nnx.Rngs):
@@ -147,14 +199,19 @@ class DecoderBlock(nnx.Module):
     def __init__(self, rngs: nnx.Rngs, embed_dim=512, attn_heads=8):
         super().__init__()
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
-        self.attention = nnx.MultiHeadAttention(
-            num_heads=attn_heads,
-            in_features=embed_dim,
-            dtype=jnp.bfloat16,
-            decode=False,
+        # self.attention = nnx.MultiHeadAttention(
+        #     num_heads=attn_heads,
+        #     in_features=embed_dim,
+        #     dtype=jnp.bfloat16,
+        #     decode=False,
+        #     rngs=rngs,
+        #     kernel_init=xavier_init,
+        #     bias_init=zero_init,
+        # )
+        self.attention = CausalSelfAttention(
             rngs=rngs,
-            kernel_init=xavier_init,
-            bias_init=zero_init,
+            embed_dim=embed_dim,
+            attn_heads=attn_heads
         )
         self.ffn_layer = MLP(embed_dim, rngs=rngs)
 
@@ -459,20 +516,24 @@ def batch_trainer(epochs, model_state, train_loader):
     stime = time.time()
 
     batch = next(iter(train_loader))
-    print("start overfitting.../")
+
+    write_note("start overfitting.../")
 
     for epoch in tqdm(range(epochs)):
         model_state, train_loss, grad_norm = train_step(model_state, batch)
-        print(
+        write_note(
             f"epoch {epoch+1}/{epochs}, train loss => {train_loss}, grad_norm => {grad_norm}"
         )
-        wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss), "train/grad_norm": grad_norm})
+        if rank == 0:
+            wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss), "train/grad_norm": grad_norm})
 
         if epoch % 50 == 0:
-            print("sample generation...")
+            write_note("sample generation...")
             pred_model = nnx.merge(model_state.graphdef, model_state.params)
             sample_text = ar_gen(pred_model)
-            wandb.log({"sample_text": sample_text})
+            
+            if rank == 0:
+                wandb.log({"sample_text": wandb.Html(sample_text)})
 
         jax.clear_caches()
         gc.collect()
