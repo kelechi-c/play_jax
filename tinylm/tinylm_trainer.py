@@ -309,129 +309,56 @@ class Transformer(nnx.Module):
         pass
 
 
-
-def generate_ar(
-    model_state,
-    initial_tokens: jax.Array,
-    max_outlen: int,
-    temperature: float = 1.0,
-    rng: jax.random.PRNGKey = None,
-    eos_token_id: int = None,
-):
-    """
-    Autoregressive text generation with temperature sampling for GPT-style models.
-    
-    Args:
-        model_state: The model forward function or state
-        initial_tokens: Initial token ids to condition on
-        max_outlen: Maximum length of the generated sequence
-        temperature: Sampling temperature (higher = more random)
-        rng: JAX random key for sampling
-        eos_token_id: Token ID that signals end of sequence
-    """
-    if rng is None:
-        rng = jrand.PRNGKey(0)
-
-    def predict_next_token(current_tokens, model_state, rng, top_k=20):
-        # Add batch dimension if needed
-        if current_tokens.ndim == 1:
-            current_tokens = current_tokens[None, :]
-            
-        # Get logits from model
-        print(f'current tokens {current_tokens.shape}')
-        logits = model_state(current_tokens.squeeze(1))
-        
-        # Apply temperature scaling to last token logits
-        last_token_logits = logits[:, -1, :] / temperature
-        
-        # Convert to probabilities
-        probabilities = jax.nn.softmax(last_token_logits, axis=-1)
-        
-        # Top-k sampling
-        if top_k > 0:
-            top_k_probs, top_k_indices = jax.lax.top_k(probabilities, k=top_k)
-            # Sample from top-k
-            next_token = jrand.categorical(rng, jnp.log(top_k_probs))
-            next_token = top_k_indices[jnp.arange(probabilities.shape[0]), next_token]
-        else:
-            # Sample from full distribution
-            next_token = jrand.categorical(rng, jnp.log(probabilities))
-            
-        return next_token[0]  # Remove batch dimension
-
-    def generate_step(carry, _):
-        tokens, rng_carry = carry
-        rng_sample, rng_carry = jrand.split(rng_carry)
-        
-        # Convert tokens list to JAX array
-        tokens_array = jnp.array(tokens)
-        
-        # Get next token prediction
-        next_token = predict_next_token(tokens_array, model_state, rng_sample)
-        
-        return (tokens + [next_token.item()], rng_carry), next_token
-
-    # Initialize token list from initial_tokens
-    tokens = initial_tokens.tolist()
-    
-    # Generate tokens up to max length
-    for _ in tqdm(range(max_outlen - len(tokens))):
-        (tokens, rng), next_token = generate_step((tokens, rng), None)
-        
-        # Break if EOS token is generated
-        if eos_token_id is not None and next_token == eos_token_id:
-            break
-            
-    return jnp.array(tokens)
-
-
 def generate_text(
     model_state,
     tokenizer=tokenizer,
-    prompt: str = 'The',
+    prompt: str = 'Given the',
     max_length: int = config.max_len,
     temperature: float = 1.0,
     seed: int = config.seed
 ):
-    """
-    Generate text from a prompt using autoregressive sampling.
-    
-    Args:
-        model: The trained model
-        tokenizer: Tokenizer for encoding/decoding text
-        prompt: Input text prompt
-        max_length: Maximum sequence length
-        temperature: Sampling temperature
-        seed: Random seed for reproducibility
-    """
-    # Encode prompt
+    # Merge graphdef and params
     model = nnx.merge(model_state.graphdef, model_state.params)
-    initial_tokens = tokenizer.encode(
-        prompt,
-        truncation=True,
-        return_tensors="np",
-        padding="max_length",
-        max_length=max_length
-    )[0]
+    key = jax.random.PRNGKey(seed)
 
-    # Create RNG key
-    rng = jrand.PRNGKey(seed) if seed is not None else jrand.PRNGKey(0)
-    
-    # Generate tokens
-    generated_tokens = generate_ar(
-        model,
-        initial_tokens,
-        max_outlen=max_length,
-        temperature=temperature,
-        rng=rng,
-        eos_token_id=tokenizer.eos_token_id
-    )
-    
-    # Decode tokens to text
-    generated_text = tokenizer.decode(generated_tokens)
-    write_note(f'generated: \n{generated_text}')
-    return generated_text
+    # Encode prompt
+    initial_tokens = tokenizer.encode(prompt)[0]
+    # print(f'{initial_tokens = }')
 
+    input_tokens = jnp.array(initial_tokens)[None]  # Add batch dimension
+    # print(f'{input_tokens.shape = } / {input_tokens = }')
+
+    generated_tokens = [initial_tokens]  # Start with the initial tokens
+
+    for _ in tqdm(range(max_length - len(generated_tokens))):
+        logits = model(input_tokens)
+
+        # Apply temperature scaling to last token logits
+        last_token_logits = logits[:, -1, :] / temperature
+        # print(f'{last_token_logits.shape = }')
+
+        # Convert to probabilities
+        probabilities = jax.nn.softmax(last_token_logits, axis=-1)
+        # print(f'probabilities = {probabilities.shape}')
+
+        # Sample the next token based on the probabilities
+        key, subkey = jax.random.split(key)
+        predicted_token_id = jax.random.categorical(subkey, last_token_logits, axis=-1)
+        # print(f'{predicted_token_id.shape = }, {predicted_token_id = }')
+        # print(tokenizer.decode(predicted_token_id))
+
+        # Append the predicted token to the generated sequence
+        generated_tokens.extend(predicted_token_id.tolist())
+
+        # Update input tokens for the next iteration (only the last generated token)
+        input_tokens = predicted_token_id[:, None]  # Add sequence dimension
+
+        # print(f'generated_tokens length = {len(generated_tokens)}')
+
+    text = tokenizer.decode(generated_tokens)
+    print(f'generated: {text}')
+
+    return text
 
 def _to_jax_array(x):
     if not isinstance(x, jax.Array):
