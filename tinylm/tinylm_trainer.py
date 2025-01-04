@@ -30,6 +30,9 @@ os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 XLA_PYTHON_CLIENT_MEM_FRACTION = 0.20
 JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
 
+def write_note(note: str):
+    if jax.process_index() == 0:
+        print(note)
 
 class config:
     depth = 12
@@ -37,11 +40,11 @@ class config:
     hidden_dim = 768
     mlp_dim = hidden_dim * 2
     vocab_size = 50_257  # GPT2Tokenizer.vocab_size
-    max_len = 128
+    max_len = 64
     seed = 256
     key = jrand.key(seed)
     split = 10_000
-    learn_rate = 1e-5
+    learn_rate = 1e-4
     save_steps = 1000
     save_period = 5000
     checkdir = 'checkpoints'
@@ -51,37 +54,34 @@ num_devices = jax.device_count()
 devices = jax.devices()
 rank = jax.process_index()
 
-print(f"found {num_devices} JAX device(s)")
+print(f"found {num_devices} JAX device(s), rank = {rank}")
 for device in devices:
     print(f"{device} /")
 
 
 mesh_devices = mesh_utils.create_device_mesh((num_devices,))
 mesh = Mesh(mesh_devices, axis_names=("data",))
-print(f"{mesh.shape = }")
+write_note(f"{mesh.shape = }")
 
 
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
-print(tokenizer.bos_token_id)
-print(f"loaded tokenizer, vocab_size = {tokenizer.vocab_size}")
+# write_note(tokenizer.bos_token_id)
+write_note(f"loaded tokenizer, vocab_size = {tokenizer.vocab_size}")
 
-with jax.transfer_guard("allow"):
-    options = ocp.CheckpointManagerOptions(
-        save_interval_steps=config.save_steps,
-        max_to_keep=1,
-        keep_period=config.save_period,  # milestones
-        create=True,
-        cleanup_tmp_directories=True,
-    )
-    async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler())
-    async_checkpoint_manager = ocp.CheckpointManager(
-        config.checkdir + "/tinylm", async_checkpointer, options
-    )
+# with jax.transfer_guard("allow"):
+#     options = ocp.CheckpointManagerOptions(
+#         save_interval_steps=config.save_steps,
+#         max_to_keep=1,
+#         keep_period=config.save_period,  # milestones
+#         create=True,
+#         cleanup_tmp_directories=True,
+#     )
+#     async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler())
+#     async_checkpoint_manager = ocp.CheckpointManager(
+#         config.checkdir + "/tinylm", async_checkpointer, options
+#     )
 
-def write_note(note: str):
-    if jax.process_index() == 0:
-        print(note)
 
 class TextData(IterableDataset):
     def __init__(self, split=128):
@@ -101,7 +101,7 @@ class TextData(IterableDataset):
                 truncation=True,
                 return_tensors="np",
                 padding="max_length",
-                max_length=128,
+                max_length=config.max_len,
             )
 
             token_ids = tokens["input_ids"]
@@ -161,7 +161,7 @@ class CausalSelfAttention(nnx.Module):
         self.outproject = nnx.Linear(
             embed_dim, embed_dim, rngs=rngs, kernel_init=xavier_init
         )
-        self.dropout = nnx.Dropout(drop, rngs=rngs)
+        # self.dropout = nnx.Dropout(drop, rngs=rngs)
 
     def __call__(self, x_input: jax.Array) -> jax.Array:
         q = self.q_linear(x_input)
@@ -181,7 +181,7 @@ class CausalSelfAttention(nnx.Module):
         attn_output = attn_score @ v 
 
         output = rearrange(attn_output, "b h l d -> b l (h d)")
-        output = self.dropout(self.outproject(output))
+        output = self.outproject(output)
 
         return output
 
@@ -234,7 +234,7 @@ class DecoderBlock(nnx.Module):
 
     def __call__(self, x_token: Array) -> Array:
         # self.attention.init_cache(dtype=jnp.bfloat16, input_shape=x_token.shape)
-
+        # print(f'{x_token.shape = }')
         x = x_token + self.layernorm(self.attention(x_token))
         x = x + self.layernorm(self.ffn_layer(x))
         return x
@@ -309,83 +309,127 @@ class Transformer(nnx.Module):
         pass
 
 
+
 def generate_ar(
     model_state,
     initial_tokens: jax.Array,
     max_outlen: int,
     temperature: float = 1.0,
-    rng=jrand.key(config.seed),
-    eos_token_id: int = tokenizer.eos_token_id,
+    rng: jax.random.PRNGKey = None,
+    eos_token_id: int = None,
 ):
+    """
+    Autoregressive text generation with temperature sampling for GPT-style models.
+    
+    Args:
+        model_state: The model forward function or state
+        initial_tokens: Initial token ids to condition on
+        max_outlen: Maximum length of the generated sequence
+        temperature: Sampling temperature (higher = more random)
+        rng: JAX random key for sampling
+        eos_token_id: Token ID that signals end of sequence
+    """
+    if rng is None:
+        rng = jrand.PRNGKey(0)
+
     def predict_next_token(current_tokens, model_state, rng, top_k=20):
-        # Add a batch dimension if it's not already there
+        # Add batch dimension if needed
         if current_tokens.ndim == 1:
             current_tokens = current_tokens[None, :]
-
-        logits = model_state(current_tokens)
-        # logits = model_state.apply_fn(
-        #     {"params": params}, current_tokens
-        # )  # Shape: (batch_size, seq_len, vocab_size)
-        logits = logits[:, -1, :] / temperature  # Take logits for the last token
-
-        # Stochastic sampling
-        probabilities = jax.nn.softmax(logits, axis=-1)
+            
+        # Get logits from model
+        print(f'current tokens {current_tokens.shape}')
+        logits = model_state(current_tokens.squeeze(1))
+        
+        # Apply temperature scaling to last token logits
+        last_token_logits = logits[:, -1, :] / temperature
+        
+        # Convert to probabilities
+        probabilities = jax.nn.softmax(last_token_logits, axis=-1)
+        
+        # Top-k sampling
         if top_k > 0:
             top_k_probs, top_k_indices = jax.lax.top_k(probabilities, k=top_k)
-            logprobs_top_k = jnp.log(top_k_probs)
-            next_token = jrand.categorical(rng, logprobs_top_k)
-            next_token = top_k_indices[jnp.arange(logits.shape[0]), next_token]
+            # Sample from top-k
+            next_token = jrand.categorical(rng, jnp.log(top_k_probs))
+            next_token = top_k_indices[jnp.arange(probabilities.shape[0]), next_token]
         else:
+            # Sample from full distribution
             next_token = jrand.categorical(rng, jnp.log(probabilities))
-
+            
         return next_token[0]  # Remove batch dimension
 
-    all_tokens = list(initial_tokens.tolist())
-
-    def generate_next_token(carry, _):
+    def generate_step(carry, _):
         tokens, rng_carry = carry
-        rng_sample, next_rng = jrand.split(rng_carry)
-        next_token = predict_next_token(
-            jnp.array(tokens), model_state, rng_sample
-        )
-        return (tokens + [next_token.item()], next_rng), next_token
+        rng_sample, rng_carry = jrand.split(rng_carry)
+        
+        # Convert tokens list to JAX array
+        tokens_array = jnp.array(tokens)
+        
+        # Get next token prediction
+        next_token = predict_next_token(tokens_array, model_state, rng_sample)
+        
+        return (tokens + [next_token.item()], rng_carry), next_token
 
-    rng_iter = rng
-    for _ in range(max_outlen - len(initial_tokens)):
-        (all_tokens, rng_iter), next_token = generate_next_token(
-            (all_tokens, rng_iter), None
-        )
+    # Initialize token list from initial_tokens
+    tokens = initial_tokens.tolist()
+    
+    # Generate tokens up to max length
+    for _ in tqdm(range(max_outlen - len(tokens))):
+        (tokens, rng), next_token = generate_step((tokens, rng), None)
+        
+        # Break if EOS token is generated
         if eos_token_id is not None and next_token == eos_token_id:
             break
+            
+    return jnp.array(tokens)
 
-    return jnp.array(all_tokens)
 
-
-# Assuming you have your trained model_state and tokenizer
-def ar_gen(model, tokenizer=tokenizer):
-    # Example usage:
-    initial_prompt = "Given the "
+def generate_text(
+    model_state,
+    tokenizer=tokenizer,
+    prompt: str = 'The',
+    max_length: int = config.max_len,
+    temperature: float = 1.0,
+    seed: int = config.seed
+):
+    """
+    Generate text from a prompt using autoregressive sampling.
+    
+    Args:
+        model: The trained model
+        tokenizer: Tokenizer for encoding/decoding text
+        prompt: Input text prompt
+        max_length: Maximum sequence length
+        temperature: Sampling temperature
+        seed: Random seed for reproducibility
+    """
+    # Encode prompt
+    model = nnx.merge(model_state.graphdef, model_state.params)
     initial_tokens = tokenizer.encode(
-        initial_prompt,
+        prompt,
         truncation=True,
         return_tensors="np",
         padding="max_length",
-        max_length=128,
-    )[0]  # Tokenize the prompt
+        max_length=max_length
+    )[0]
 
-    rng_generate = randkey  # Separate RNG for generation
+    # Create RNG key
+    rng = jrand.PRNGKey(seed) if seed is not None else jrand.PRNGKey(0)
+    
+    # Generate tokens
     generated_tokens = generate_ar(
         model,
         initial_tokens,
-        max_outlen=128,
-        temperature=1.0,
-        rng=rng_generate,
-        eos_token_id=tokenizer.eos_token_id,
+        max_outlen=max_length,
+        temperature=temperature,
+        rng=rng,
+        eos_token_id=tokenizer.eos_token_id
     )
-
+    
+    # Decode tokens to text
     generated_text = tokenizer.decode(generated_tokens)
-    write_note(f"Input: {initial_prompt} \n Generated text: {generated_text}")
-
+    write_note(f'generated: \n{generated_text}')
     return generated_text
 
 
@@ -465,8 +509,8 @@ def jax_collate(batch):
 def modelpass(logits, tokens):
     # print(f"first, {logits.shape = } / {tokens.shape = }")
 
-    output = logits.squeeze(1)[..., :-1, :]
-    targets = tokens.squeeze(1)[..., 1:]
+    output = logits[..., :-1, :]
+    targets = tokens[..., 1:]
 
     output = output.reshape(-1, output.shape[-1])
     targets = jnp.expand_dims(targets.reshape(-1), axis=-1)  # jnp.expand_dims(axis=-1)
@@ -480,16 +524,17 @@ def modelpass(logits, tokens):
 
 # compile multidevice versions of train/eval/predict step fn.
 lm_model = Transformer(
-    n_layers=6, embed_dim=768, attn_heads=8, rngs=nnx.Rngs(config.seed)
+    n_layers=12, embed_dim=768, attn_heads=12, rngs=nnx.Rngs(config.seed)
 )
-tx_optimizer = optax.adamw(learning_rate=1e-4)
+lm_model.train()
+tx_optimizer = optax.adamw(learning_rate=3e-4)
 
 state, state_sharding = initialize_state(lm_model, mesh, tx_optimizer)
 data_sharding = NS(mesh, PS("data"))
 rep_sharding = NS(mesh, PS())
 
-print('Train_state/model sharding: ')
-pprint(state_sharding, indent=2, width=150, compact=True)
+# print('Train_state/model sharding: ')
+# pprint(state_sharding, indent=2, width=150, compact=True)
 
 
 @partial(
@@ -504,7 +549,7 @@ def train_step(model_state, batch):
         model = nnx.merge(model_state.graphdef, params)
 
         tokens = batch["input_ids"]
-        logits = model(tokens)
+        logits = model(tokens.squeeze(1))
 
         output, targets = modelpass(logits, tokens)
         one_hot_targets = jax.nn.one_hot(
@@ -545,31 +590,31 @@ def batch_trainer(epochs, model_state, train_loader):
         write_note(
             f"epoch {epoch+1}/{epochs}, train loss => {train_loss}, grad_norm => {grad_norm}"
         )
-        if rank == 0:
-            wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss), "train/grad_norm": grad_norm})
 
-        with jax.transfer_guard("allow"):
-            async_checkpoint_manager.save(epoch, model_state)
+        # if rank == 0:
+        #     wandb.log({"train/loss": train_loss, "train/log_loss": math.log10(train_loss), "train/grad_norm": grad_norm})
 
-        if epoch % 50 == 0:
+
+        if epoch % 100 == 0 and rank == 0:
+            # with jax.transfer_guard("allow"):
+            #     async_checkpoint_manager.save(epoch, model_state)
+            
             write_note("sample generation...")
-            pred_model = nnx.merge(model_state.graphdef, model_state.params)
-            sample_text = ar_gen(pred_model)
-
-            if rank == 0:
-                wandb.log({"sample_text": wandb.Html(sample_text)})
+            # pred_model = nnx.merge(model_state.graphdef, model_state.params)
+            sample_text = generate_text(model_state)
+            # wandb.log({"sample_text": wandb.Html(sample_text)})
 
         jax.clear_caches()
         gc.collect()
 
     etime = time.time() - stime
-    print(
+    write_note(
         f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
     )
 
-    with jax.transfer_guard("allow"):
-        async_checkpoint_manager.save(epochs, model_state)
-        async_checkpoint_manager.wait_until_finished()
+    # with jax.transfer_guard("allow"):
+    #     async_checkpoint_manager.save(epochs, model_state)
+    #     async_checkpoint_manager.wait_until_finished()
 
     return model_state, train_loss
 
@@ -582,7 +627,7 @@ def trainer(epochs, model_state, train_loader):
         # wandb_logger(key="", project_name="tinylm_jax")
     stime = time.time()
 
-    print("start training.../")
+    write_note("start training.../")
 
     for epoch in tqdm(range(epochs)):
         for step, batch in tqdm(enumerate(train_loader)):
@@ -607,34 +652,33 @@ def trainer(epochs, model_state, train_loader):
 @click.command()
 @click.option("-r", "--run", default="single_batch")
 @click.option("-e", "--epochs", default=30)
-@click.option("-bs", "--batch_size", default=8)
+@click.option("-bs", "--batch_size", default=16)
 def main(run, epochs, batch_size):
-
+    lm_model.train()
     textdata = TextData()
     train_loader = DataLoader(textdata, batch_size=batch_size, collate_fn=jax_collate)
 
     vs = next(iter(train_loader))
-    print(f"sample token shape: {vs['input_ids'].shape}")
+    write_note(f"sample token shape: {vs['input_ids'].shape}")
 
     rantoks = jrand.randint(randkey, (vs["input_ids"].shape), 1, 1000)
 
-    testout = lm_model(vs["input_ids"])
-    print(f"test output shape => {testout.shape}")
+    testout = lm_model(vs["input_ids"].squeeze(1))
+    write_note(f"test output shape => {testout.shape}")
 
     n_params = sum([p.size for p in jax.tree.leaves(nnx.state(lm_model))])
-    print(f"model parameters count: {n_params/1e6:.2f}M, ")
+    write_note(f"model parameters count: {n_params/1e6:.2f}M, ")
     
-    # print("sample generation...")
-    # # pred_model = nnx.merge(state.graphdef, model_state.params)
-    # sample_text = ar_gen(lm_model)
+    write_note("sample generation...")
+    sample_text = generate_text(state)
 
     if run == "single_batch":
         model_state, loss = batch_trainer(epochs, state, train_loader=train_loader)
         wandb.finish()
-        print(f"single batch training ended at loss: {loss:.4f}")
+        write_note(f"single batch training ended at loss: {loss:.4f}")
 
     elif run == "train":
-        print(f"you missed your train looop impl boy")
+        write_note(f"you missed your train looop impl boy")
 
 
 main()
