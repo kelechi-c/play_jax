@@ -1,15 +1,26 @@
 from jax import numpy as jnp, random as jrand, Array
+import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from functools import partial
 from flax.training import train_state
-import flax.traverse_util, builtins
+import flax.traverse_util, builtins, torch
 from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
-import json
+import json, os
+from PIL import Image
 from safetensors import safe_open
 from cosmos_tokenizer.image_lib import ImageTokenizer
+from huggingface_hub import login, snapshot_download
 
+
+model_name = "Cosmos-Tokenizer-DI8x8"
+hf_repo = f"nvidia/{model_name}"
+local_dir = 'checks'
+snapshot_download(repo_id=model_name, local_dir=local_dir)
+decoder = ImageTokenizer(
+    checkpoint_dec=f"{local_dir}/{model_name}/decoder.jit"
+)
 
 class ImageTokenDataset(Dataset):
     def __init__(self, safetensor_path="./imagenet_di8x8.safetensors", debug=True):
@@ -43,3 +54,17 @@ class ImageTokenDataset(Dataset):
         class_label = self.labels[idx]
 
         return {"input_ids": indices, "class_label": class_label}
+
+def decode(data):
+    data = data.reshape(1, 32, 32)
+    data = torch.from_numpy(np.array(data))
+    
+    # Decode the image
+    with torch.no_grad():
+        reconstructed = decoder.decode(data)
+
+    img = ((reconstructed[0].cpu().float() + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+    img = img.permute(1, 2, 0).numpy()
+    img = Image.fromarray(img)
+    
+    return img
