@@ -10,6 +10,7 @@ from einops import rearrange
 import numpy as np
 from cosmos_tokenizer.image_lib import ImageTokenizer
 import optax
+from tqdm import tqdm
 
 class config:
     vocab_size: int = 64 * (68000 // 64)
@@ -22,6 +23,7 @@ class config:
     seed = 333
     dtype = jnp.bfloat16
 
+randkey = jrand.key(config.seed)
 rngs = nnx.Rngs(config.seed)
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
@@ -182,7 +184,7 @@ class ART(nnx.Module):
     def __init__(self, config=config):
         self.layers = [DecoderBlock() for _ in range(config.depth)]
         self.transformer = nnx.Sequential(*self.layers)
-        
+
         self.token_embed = nnx.Embed(
             config.vocab_size, config.n_embd, rngs=rngs, 
             embedding_init=normal_init
@@ -203,28 +205,68 @@ class ART(nnx.Module):
         targets = token_idx
         token_idx = token_idx[:, :-1]
         token_seq = jnp.concat([c_tokens[None], token_idx], axis=1)
-        
+
         freq = self.rotary(None, hw=(32, 32))
-        
+
         x = self.token_embed(token_seq)        
         x = x + x[:, 0:1, :]
         x = self.rms_norm(x)
-        
+
         v1 = None
         for block in self.layers:
             x, v1 = block(x, freq=freq, v1=v1)[0]
-        
+
         x = self.rms_norm(x)
         logits = self.linear_head(x).astype(config.dtype)
-        
+
         loss = optax.softmax_cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             targets.reshape(-1)
         )
-        
+
         return logits, loss
-    
-    def generate(self, class_labels, max_tokens=1024, temp=1.0, topk=None):
+
+    def generate(self, class_labels: Array, max_tokens=1024, temp=1.0, cfg_scale=5.0, topk=None):
         b = class_labels.shape[0]
+        class_labels = class_labels.repeat(2)
+        class_labels[b:] = 1000
+        x = (class_labels + 65536)[:, None]
+        kv_caches = [(0,0) * len(self.layers)]
+        x_init = self.token_embed(x)
         
-        
+        freq = self.rotary(None, hw=(32, 32))
+        cos, sin = freq
+        x_all = x
+
+        for k in tqdm(range(max_tokens)):
+            x_emb = self.token_embed(x_all[:, -1:])
+            x_emb = self.rms_norm(x_emb)
+            cos_local = cos[:, k: k+1, :, :]
+            sin_local = sin[:, k : k + 1, :, :]
+
+            freq_local = (cos_local, sin_local)
+            v1 = None
+            
+            for n, layer in enumerate(self.layers):
+                (x_emb, v1), new_kv_cache = layer(x_emb, kv_caches[n], freq=freq_local, v1=v1)
+                kv_caches[n] = new_kv_cache
+                
+            x_emb = self.rms_norm(x_emb)
+            logits = self.linear_head(x_emb)
+            
+            logits_cond = logits[:b, :]
+            logits_uncond = logits[b:, :]
+            logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+            logits = logits / temp
+            
+            if topk is not None:
+                v, _ = jax.lax.top_k(logits, min(topk, logits.shape[-1]))
+                logits[logits < v[:,[-1]]] = jnp.inf
+                
+            probs = nnx.softmax(logits.squeeze(1), axis=-1)
+            idx_next = jrand.categorical(randkey, probs, axis=1)
+            idx_next = jnp.tile(idx_next, (2, 1))
+            x_all = jnp.concat([x_all, idx_next], axis=1)
+            
+        return x_all[:, 1:]
+    
