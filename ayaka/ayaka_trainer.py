@@ -1,4 +1,4 @@
-import jax, flax, math, torch
+import jax, flax, math, torch, optax
 from jax import numpy as jnp, random as jrand, Array
 from flax import nnx
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
@@ -105,7 +105,6 @@ class ImageTokenDataset(Dataset):
 def decode(data):
     data = data.reshape(1, 32, 32)
     data = torch.from_numpy(np.array(data))
-
     # Decode the image
     with torch.no_grad():
         reconstructed = decoder.decode(data)
@@ -118,16 +117,14 @@ def decode(data):
 
 
 def inspect_latents(batch):
-    batch = rearrange(batch, "b c h w -> b h w c")
-    # print(batch.shape)
-    # img_latents = img_latents / config.vaescale_factor
-    batch = [process_img(x) for x in batch]
-    file = f"images/preproc_cc-by.jpg"
+    batch = [decode(x) for x in batch]
+    file = f"images/imagenet-cosmos.jpg"
     gridfile = image_grid(batch, file)
+    
     print(f"sample saved @ {gridfile}")
 
 
-def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 2)):
+def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 4)):
     rows, cols = grid_size
     assert len(pil_images) <= rows * cols, "Grid size must accommodate all images."
 
@@ -149,43 +146,27 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 2)):
 
     return file
 
-def sample_image_batch(step, model, batch):
-    labels, shape, ground_latents, captions = (
-        batch["text_embedding"][:9],
-        batch["vae_latent_shape"][:9],
-        batch["vae_latent"][:9],
-        batch["caption"][:9],
-    )
-    # print(shape)
-    start_noise = jrand.normal(randkey, (len(labels), shape[1], shape[2], shape[0]))
-    print(f"sampling from noise of shape {start_noise.shape} / captions {captions}")
-
+def ar_sample_batch(step, model, batch):
+    labels = batch["class_label"][:9]
+    print(f"sampling from labels {labels}")
+    
     pred_model = device_get_model(model)
     pred_model.eval()
 
-    image_batch = pred_model.sample(start_noise, labels)
-
-    batch_latents = rearrange(ground_latents, "b c h w -> b h w c")
-    v_sample_error = (batch_latents - image_batch) ** 2
-
-    file = f"mdsamples/{step}_microdit.png"
-    batch = [process_img(x) for x in image_batch]
-
+    image_batch = pred_model.generate(labels)
+    
+    file = f"arsamples/ayaka_{step}.png"
+    batch = [decode(x) for x in image_batch]
     gridfile = image_grid(batch, file)
-    print(f"sample saved @ {gridfile}")
 
     del pred_model
     jax.clear_caches()
     gc.collect()
 
-    v_sample_error = v_sample_error.mean()
-
-    print(f"sample_error {v_sample_error}")
-
-    return gridfile, v_sample_error
+    return gridfile
 
 
-def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
+def wandb_logger(key: str, project_name='ayaka_ar', run_name=None):  # wandb logger
     # initilaize wandb
     wandb.login(key=key)
     wandb.init(
@@ -204,7 +185,7 @@ def device_get_model(model):
 
 
 # save model params in pickle file
-def save_paramdict_pickle(model, filename="dit_model.ckpt"):
+def save_paramdict_pickle(model, filename="model.ckpt"):
     params = nnx.state(model)
     params = jax.device_get(params)
 
@@ -219,7 +200,7 @@ def save_paramdict_pickle(model, filename="dit_model.ckpt"):
     return flat_state_dict
 
 
-def load_paramdict_pickle(model, filename="dit_model.ckpt"):
+def load_paramdict_pickle(model, filename="model.ckpt"):
     with open(filename, "rb") as modelfile:
         params = pickle.load(modelfile)
 
@@ -236,21 +217,14 @@ def load_paramdict_pickle(model, filename="dit_model.ckpt"):
     in_shardings=(rep_sharding, rep_sharding, data_sharding, data_sharding),
     out_shardings=(None, None),
 )
-def train_step(model, optimizer, image, text):
-
-    def loss_func(model, img_latents, label):
-        img_latents = (
-            rearrange(img_latents, "b c h w -> b h w c") * config.vaescale_factor
-        )
-        loss = model(img_latents, label)
-
+def train_step(model, optimizer, tokens, label):
+    def loss_func(model, tokens, label):
+        logits, loss = model(tokens, label)
         return loss
 
     gradfn = nnx.value_and_grad(loss_func)
-    loss, grads = gradfn(model, image, text)
-
+    loss, grads = gradfn(model, tokens, label)
     grad_norm = optax.global_norm(grads)
-
     optimizer.update(grads)
 
     return loss, grad_norm
@@ -259,18 +233,15 @@ def train_step(model, optimizer, image, text):
 def overfit(epochs, model, optimizer, train_loader, schedule):
     train_loss = 0.0
     model.train()
-
+    
     batch = next(iter(train_loader))
-
-    wandb_logger(key="yourkey", project_name="microdit_overfit")
-
+    wandb_logger(key="yourkey", run_name='ayaka_overfit')
     stime = time.time()
 
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
         lr = schedule(epoch)
-
-        latent, text_embed = batch["vae_latent"], batch["text_embedding"]
+        latent, text_embed = batch["input_ids"], batch["class_labels"]
         train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)
         print(
             f"step {epoch}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm.item()}"
@@ -287,9 +258,9 @@ def overfit(epochs, model, optimizer, train_loader, schedule):
         )
 
         if epoch % 25 == 0 and epoch != 0:
-            gridfile, sample_error = sample_image_batch(epoch, model, batch)
+            gridfile = ar_sample_batch(epoch, model, batch)
             image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log, "sample_error": sample_error})
+            wandb.log({"image_sample": image_log})
 
         jax.clear_caches()
         gc.collect()
