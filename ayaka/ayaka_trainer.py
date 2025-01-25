@@ -3,24 +3,28 @@ from jax import numpy as jnp, random as jrand, Array
 from flax import nnx
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
-jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from functools import partial
 from flax.training import train_state
-import flax.traverse_util, builtins, torch
+import flax.traverse_util, builtins
 from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
-import json, os, wandb, gc, time, pickle
+
+import json, os, wandb, gc, time, pickle, click
 import matplotlib.pyplot as plt
 from PIL import Image
 from safetensors import safe_open
 from cosmos_tokenizer.image_lib import ImageTokenizer
 from huggingface_hub import login, snapshot_download
 
+from ayaka.ar_model import ART
+
+login('')
 # XLA/JAX flags
+jax.config.update("jax_default_matmul_precision", "bfloat16")
 JAX_TRACEBACK_FILTERING = "off"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
@@ -233,7 +237,7 @@ def train_step(model, optimizer, tokens, label):
 def overfit(epochs, model, optimizer, train_loader, schedule):
     train_loss = 0.0
     model.train()
-    
+
     batch = next(iter(train_loader))
     wandb_logger(key="yourkey", run_name='ayaka_overfit')
     stime = time.time()
@@ -270,3 +274,66 @@ def overfit(epochs, model, optimizer, train_loader, schedule):
         f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
     )
     return model, train_loss
+
+
+def jax_collate(batch):
+    tokens = jnp.stack([jnp.array(item["input_ids"]) for item in batch], axis=0)
+    labels = jnp.stack([jnp.array(item["class_labes"]) for item in batch], axis=0)
+
+    return {
+        "input_ids": tokens,
+        "class_labels": labels,
+    }
+
+
+@click.command()
+@click.option("-r", "--run", default="overfit")
+@click.option("-e", "--epochs", default=10)
+@click.option("-bs", "--batch_size", default=config.batch_size)
+def main(run, epochs, batch_size):
+
+    dataset = ImageTokenDataset()
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=jax_collate)
+
+    sp = next(iter(train_loader))
+    print(
+        f"loaded dataset, sample data shape {sp['input_ids'].shape} /  {sp['class_label'].shape}"
+    )
+
+    inspect_latents(sp["input_ids"])
+
+    ar_model = ART()
+    graph, state = nnx.split(ar_model)
+
+    n_params = sum([p.size for p in jax.tree.leaves(state)])
+    print(f"model parameters count: {n_params/1e6:.2f}M")
+
+    initial_learning_rate = 3e-4
+    end_learning_rate = 3e-5
+    power = 1  # setting this to 1 makes it a linear schedule
+    schedule = optax.polynomial_schedule(
+        init_value=initial_learning_rate,
+        end_value=end_learning_rate,
+        power=power,
+        transition_steps=5000
+    )
+
+    optimizer = nnx.Optimizer(
+        ar_model,
+        optax.chain(
+            optax.clip_by_global_norm(2.0),
+            optax.adamw(schedule, b1=0.9, b2=0.995, eps=1e-9, weight_decay=0.001),
+        ),
+    )
+    if run == "overfit":
+        model, loss = overfit(epochs, ar_model, optimizer, train_loader, schedule)
+        wandb.finish()
+        print(f"microdit overfitting ended at loss {loss:.4f}")
+
+    # elif run == "train":
+    #     trainer(ar_model, optimizer, train_loader, schedule=schedule, epochs=epochs)
+    #     wandb.finish()
+    #     print("microdit (test) training (on imagenet-1k) in JAX..done")
+
+
+main()
