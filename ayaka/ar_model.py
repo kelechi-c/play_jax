@@ -7,10 +7,10 @@ import jax, math
 from jax import numpy as jnp, random as jrand, Array
 from flax import nnx
 from einops import rearrange
-import numpy as np
 from cosmos_tokenizer.image_lib import ImageTokenizer
+import numpy as np
 import optax
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 class config:
     vocab_size: int = 64 * (68000 // 64)
@@ -22,6 +22,7 @@ class config:
     v_residual: bool = False
     seed = 333
     dtype = jnp.bfloat16
+
 
 randkey = jrand.key(config.seed)
 rngs = nnx.Rngs(config.seed)
@@ -38,13 +39,69 @@ class Rotary(nnx.Module):
         self.inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2)).float() / (dim))
         self.h = h
         self.w = w
+
+        t_h = jnp.arange(h)
+        t_w = jnp.arange(w)
+
+        freqs_h = jnp.outer(t_h, self.inv_freq)[:, None]
+        freqs_w = jnp.outer(t_w, self.inv_freq)[None]
+        freqs_h = jnp.tile(freqs_h, (1, w, 1))
+        freqs_w = jnp.tile(freqs_w, (h, 1, 1))
+        freqs_hw = jnp.concat([freqs_h, freqs_w], axis=2)
+
+        self.freqs_hw_cos = nnx.Param(jnp.cos(freqs_hw))
+        self.freqs_hw_sin = nnx.Param(jnp.sin(freqs_hw))
+
+        self.cache_cos = None
+        self.cache_sin = None
+
+    def __call__(self, x: Array, hw=None, extend_with_register_tokens=0, augment=False):
+        if self.cache_cos is not None and self.cache_sin is not None:
+            return self.cache_cos, self.cache_sin
+
+        if hw is not None:
+            this_h, this_w = hw
+        else:
+            this_hw = x.shape[1]
+            this_h, this_w = int(this_hw**0.5), int(this_hw**0.5)
+
+        if augment:
+            start_h = jrand.randint(randkey, (1,), 0, self.h - this_h + 1).item()
+            start_w = jrand.randint(randkey, (1,), 0, self.w - this_w + 1).item()
+        else:
+            start_h = 0
+            start_w = 0
+
+        cos = self.freqs_hw_cos[start_h:start_h + this_h, start_w:start_w+this_w]
+        sin = self.freqs_hw_cos[start_h : start_h + this_h, start_w : start_w + this_w]
+
+        cos = cos.reshape(this_h * this_w, -1)
+        sin = sin.reshape(this_h * this_w, -1)
+
+        if extend_with_register_tokens > 0:
+            cos = jnp.concat(
+                [
+                    jnp.ones((extend_with_register_tokens, cos.shape[1]), device=cos.device),
+                    cos
+                ], axis=0
+            )
+            sin = jnp.concat(
+                [
+                    jnp.zeros(
+                        (extend_with_register_tokens, sin.shape[1]), device=cos.device
+                    ),
+                    sin,
+                ],
+                axis=0,
+            )
+        # update cache 
+        self.cache_cos = cos[None, :, None, :] # 1, N, 1, D 
+        self.cache_sin = sin[None, :, None, :] 
         
-        # t_h = 
-    def __call__(self, x, hw=None):
-        pass
+        return self.cache_cos, self.cache_sin
 
 
-def apply_rotary_embed(x, cos, sin):
+def apply_rotary_embed(x: Array, cos: Array, sin: Array):
     cos, sin = cos[:, :x.shape[1]], sin[:, :x.shape[1]]
     assert x.ndim == 4
     d = x.shape[3] // 2
@@ -55,6 +112,8 @@ def apply_rotary_embed(x, cos, sin):
     
     return jnp.concat([y1, y2], axis=3).astype(x.dtype)
 
+
+# causal self attention block
 class CausalAttention(nnx.Module):
     def __init__(self, config=config):
         dim = config.n_embd
@@ -84,7 +143,7 @@ class CausalAttention(nnx.Module):
         self.lamb2 = nnx.Param(jnp.array(0.5))
         self.rms_norm = nnx.RMSNorm(dim, rngs=rngs)
 
-    def __call__(self, x: Array, attn_mask=None, kv_cache=None, freq=None, v1=None):
+    def __call__(self, x: Array, attn_mask=None, kv_cache=None, freq: tuple=None, v1=None):
         N, T, D = x.shape
 
         q = self.q_linear(x).reshape(N, T, self.heads, self.head_dim)
@@ -145,7 +204,7 @@ class MLP(nnx.Module):
 
         return x
 
-
+# SwiGLU feedforward layer
 class FeedForward(nnx.Module):
     def __init__(self, embed_dim, mlp_ratio=4):
         super().__init__()
@@ -166,6 +225,7 @@ class FeedForward(nnx.Module):
         x = self.w_3(x)
         return x
 
+# simple transformer decoder block
 class DecoderBlock(nnx.Module):
     def __init__(self, config=config):
         self.attn = CausalAttention(config)
@@ -180,6 +240,7 @@ class DecoderBlock(nnx.Module):
         return (x, v1), new_kv_cache
 
 
+# autoregressive transformer for image generation
 class ART(nnx.Module):
     def __init__(self, config=config):
         self.layers = [DecoderBlock() for _ in range(config.depth)]
@@ -206,7 +267,7 @@ class ART(nnx.Module):
         token_idx = token_idx[:, :-1]
         token_seq = jnp.concat([c_tokens[None], token_idx], axis=1)
 
-        freq = self.rotary(None, hw=(32, 32))
+        freq = self.rotary(token_idx, hw=(32, 32))
 
         x = self.token_embed(token_seq)        
         x = x + x[:, 0:1, :]
@@ -234,7 +295,7 @@ class ART(nnx.Module):
         kv_caches = [(0,0) * len(self.layers)]
         x_init = self.token_embed(x)
         
-        freq = self.rotary(None, hw=(32, 32))
+        freq = self.rotary(x_init, hw=(32, 32))
         cos, sin = freq
         x_all = x
 
@@ -269,4 +330,3 @@ class ART(nnx.Module):
             x_all = jnp.concat([x_all, idx_next], axis=1)
             
         return x_all[:, 1:]
-    
