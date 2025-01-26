@@ -5,7 +5,7 @@ from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm.auto import tqdm
 from functools import partial
 from flax.training import train_state
@@ -18,8 +18,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from safetensors import safe_open
 from cosmos_tokenizer.image_lib import ImageTokenizer
-from huggingface_hub import login, snapshot_download
-
+from huggingface_hub import login, snapshot_download, file_download
 from ayaka.ar_model import ART
 
 login('')
@@ -31,6 +30,7 @@ os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 XLA_PYTHON_CLIENT_MEM_FRACTION = 0.20
 JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
 
+file_download.hf_hub_download()
 
 class config:
     batch_size = 128
@@ -63,20 +63,25 @@ mesh = Mesh(mesh_devices, axis_names=("data"))
 data_sharding = NS(mesh, PS("data"))
 rep_sharding = NS(mesh, PS())
 
-model_name = "Cosmos-Tokenizer-DI8x8"
+model_name = "Cosmos-0.1-Tokenizer-DI8x8"
 hf_repo = f"nvidia/{model_name}"
-local_dir = 'checks'
+local_dir = "checks"
 os.makedirs(local_dir, exist_ok=True)
-snapshot_download(repo_id=model_name, local_dir=local_dir)
-decoder = ImageTokenizer(
-    checkpoint_dec=f"{local_dir}/{model_name}/decoder.jit"
-)
+snapshot_download(repo_id=hf_repo, local_dir=local_dir)
+decoder = ImageTokenizer(checkpoint_dec=f"{local_dir}/cosmos/decoder.jit", device='tpu')
 
-class ImageTokenDataset(Dataset):
-    def __init__(self, safetensor_path="./imagenet_di8x8.safetensors", debug=True):
+snapshot_download(repo_id="fal/cosmos-imagenet", local_dir='data/cosmos_imagenet', repo_type=)
+
+class ImageTokenDataset(IterableDataset):
+
+    def __init__(
+        self,
+        safetensor_path="./data/cosmos_imagenet/imagenet_di8x8.safetensors",
+        debug=True,
+    ):
         self.safetensor_path = safetensor_path
         self.split = 100_000
-        
+
         metadata_path = safetensor_path.replace(".safetensors", "_metadata.json")
         with open(metadata_path, "r") as f:
             self.metadata = json.load(f)
@@ -86,8 +91,12 @@ class ImageTokenDataset(Dataset):
             self.total_samples = 16
 
         with safe_open(safetensor_path, framework="flax") as f:
-            self.indices = f.get_tensor("indices").to(jnp.uint16).astype(jnp.int64)[:self.split]
-            self.labels = f.get_tensor("labels").astype(jnp.int64)[:self.split]
+            self.indices = (
+                f.get_tensor("indices")
+                .astype(jnp.uint16)
+                .astype(jnp.int64)[: self.split]
+            )
+            self.labels = f.get_tensor("labels").astype(jnp.int64)[: self.split]
 
         if debug:
             self.indices = self.indices[:16]
@@ -96,23 +105,24 @@ class ImageTokenDataset(Dataset):
     def __len__(self):
         return int(self.total_samples)
 
-    def __getitem__(self, idx):
-        indices = self.indices[idx].reshape(-1)
-        # replace randomly with 1000
-        fill_cond = jrand.normal(randkey, (indices.shape)) < 0.05
-        indices = jnp.where(fill_cond, indices, 1000)
-        class_label = self.labels[idx]
+    def __iter__(self):
+        for tokens, labels in zip(self.indices, self.labels):
+            indices = tokens.reshape(-1)
+            # replace randomly with 1000
+            fill_cond = jrand.normal(randkey, (indices.shape)) < 0.05
+            indices = jnp.where(fill_cond, indices, 1000)
+            class_label = labels
 
-        return {"input_ids": indices, "class_label": class_label}
+            yield {"input_ids": indices, "class_label": class_label}
 
 
 def decode(data):
-    data = data.reshape(1, 32, 32)
     data = torch.from_numpy(np.array(data))
+    data = data.reshape(1, 32, 32).long()
     # Decode the image
     with torch.no_grad():
         reconstructed = decoder.decode(data)
-
+    print(f'{reconstructed.shape = }')
     img = ((reconstructed[0].cpu().float() + 1) * 127.5).clamp(0, 255).to(torch.uint8)
     img = img.permute(1, 2, 0).numpy()
     img = Image.fromarray(img)
@@ -150,15 +160,20 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 4)):
 
     return file
 
+# jax.lax.scan()
+nnx.scan(image_grid)
 def ar_sample_batch(step, model, batch):
-    labels = batch["class_label"][:9]
+    labels = batch["class_label"][:16]
     print(f"sampling from labels {labels}")
-    
-    pred_model = device_get_model(model)
+
+    pred_model = model #device_get_model(model)
     pred_model.eval()
 
     image_batch = pred_model.generate(labels)
-    
+    image_batch = jax.device_get(image_batch)
+    # image_batch = ar_generate(pred_model, labels)
+    print('gen complete..decoding')
+
     file = f"arsamples/ayaka_{step}.png"
     batch = [decode(x) for x in image_batch]
     gridfile = image_grid(batch, file)

@@ -159,7 +159,8 @@ class CausalAttention(nnx.Module):
         self, x: Array, attn_mask=None, kv_cache=None, freq: tuple = None, v1=None
     ):
         N, T, D = x.shape
-        # print(f"attn xin {x.shape}")
+    
+        # print(f"attn xinx {x.shape}")
 
         q = self.q_linear(x)  # .reshape(N, T, self.heads, self.head_dim)
         k = self.k_linear(x)  # .reshape(N, T, self.heads, self.head_dim)
@@ -230,7 +231,6 @@ class CausalAttention(nnx.Module):
         # print(f"y out = {y.shape}")
 
         return (y, v1), new_kv_cache
-
 
 
 class MLP(nnx.Module):
@@ -348,7 +348,6 @@ class ART(nnx.Module):
 
         return logits, loss
 
-
     # @partial(nnx.jit, static_argnames=("max_tokens", "temp", "cfg_scale", "topk"))
     def generate(
         self, class_labels: Array, max_tokens=1024, temp=1.0, cfg_scale=4.0, topk=None
@@ -422,3 +421,88 @@ class ART(nnx.Module):
             # print(f"{x_all[:, 1:].shape = }")
 
         return x_all[:, 1:]
+nnx.d
+
+    @partial(nnx.jit, static_argnames=("max_tokens", "temp", "cfg_scale", "topk"))
+    def generate(
+        self,
+        class_labels: jax.Array,
+        rng: jrand.PRNGKey = jrand.PRNGKey(config.seed),
+        max_tokens: int = 1024,
+        temp: float = 1.0,
+        cfg_scale: float = 4.0,
+        topk: int = None,
+    ) -> jax.Array:
+        b = class_labels.shape[0]
+        class_labels = jnp.tile(class_labels, (2,))
+        class_labels = class_labels.at[b].set(1000)
+        x = (class_labels + 65536)[:, None]  # Initial token
+
+        # Pre-allocate output array
+        x_all = jnp.zeros((2 * b, max_tokens + 1), dtype=x.dtype)
+        x_all = x_all.at[:, 0].set(x.squeeze())
+
+        # Initial embeddings and rotary frequencies
+        x_init = self.token_embed(x)
+        dummy_emb = jnp.zeros(
+            (2 * b, max_tokens + 1, x_init.shape[-1])
+        )  # For full sequence length
+        cos, sin = self.rotary(dummy_emb, hw=(32, 32))
+
+        # Initialize KV caches properly (example shape - adjust based on your model)
+        num_heads = 8  # Example value
+        head_dim = 64  # Example value
+        kv_shape = (2 * b, num_heads, max_tokens + 1, head_dim)
+        kv_caches = [(jnp.zeros(kv_shape), jnp.zeros(kv_shape)) for _ in self.layers]
+
+        def loop_body(k, state):
+            x_all, kv_caches, rng = state
+            current_token = x_all[:, k]
+
+            # Embed current token
+            x_emb = self.token_embed(current_token[:, None])
+            x_emb = x_emb + x_init
+            x_emb = self.rms_norm(x_emb)
+
+            # Get rotary embeddings for this position
+            cos_local = cos[:, k : k + 1, :, :]
+            sin_local = sin[:, k : k + 1, :, :]
+            freq_local = (cos_local, sin_local)
+
+            # Process through layers
+            new_kv_caches = []
+            v1 = None
+            current_emb = x_emb
+            for n, layer in enumerate(self.layers):
+                (current_emb, v1), new_kv = layer(
+                    current_emb, kv_cache=kv_caches[n], freq=freq_local, v1=v1
+                )
+                new_kv_caches.append(new_kv)
+
+            # Final processing
+            current_emb = self.rms_norm(current_emb)
+            logits = self.linear_head(current_emb)
+
+            # CFG scaling
+            logits_cond, logits_uncond = logits[:b], logits[b:]
+            logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+            logits = logits / temp
+
+            # Top-k filtering
+            if topk is not None:
+                v, _ = lax.top_k(logits, min(topk, logits.shape[-1]))
+                logits = jnp.where(logits < v[..., -1:], -jnp.inf, logits)
+
+            # Sampling
+            rng, subkey = jax.random.split(rng)
+            probs = jax.nn.softmax(logits.squeeze(1), axis=-1)
+            next_token = jax.random.categorical(subkey, probs, axis=-1)
+
+            # Update state
+            x_all = x_all.at[:, k + 1].set(next_token)
+            return (x_all, new_kv_caches, rng)
+
+        # Execute the loop
+        final_x, _, _ = lax.fori_loop(0, max_tokens, loop_body, (x_all, kv_caches, rng))
+
+        return final_x[:, 1:]  # Remove initial token
