@@ -2,7 +2,6 @@
 Implementation of an Autoregressive Image generation model in JAX/Flax,
 adapted from https://github.com/fal-ai/diffusion-speedrun
 """
-
 import jax, math
 from jax import numpy as jnp, random as jrand, Array
 from flax import nnx
@@ -35,7 +34,7 @@ trunc_init = nnx.initializers.truncated_normal(0.02)
 
 
 class Rotary(nnx.Module):
-    def __init__(self, dim, base=100, h=128, w=128):
+    def __init__(self, dim, base=100, h=32, w=32):
         super().__init__()
         inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2)).astype(config.dtype) / (dim))
 
@@ -106,10 +105,11 @@ class Rotary(nnx.Module):
         return self.cache_cos.value, self.cache_sin.value
 
 
-def rms_norm(x, target_rms=1.0, epsilon=1e-8):
-    rms = jnp.sqrt(jnp.mean(jnp.square(x)))
-    scale_factor = target_rms / (rms + epsilon)
-    normalized_x = x * scale_factor
+def rms_norm(x, dim=-1, target_rms=1.0, eps=1e-8):
+    # return normalized_x
+    rms = jnp.sqrt(jnp.mean(jnp.square(x), axis=dim, keepdims=True) + eps)
+    # 2. Normalize by dividing by RMS
+    normalized_x = x / rms
     return normalized_x
 
 
@@ -127,10 +127,8 @@ def apply_rotary_embed(x: Array, cos: Array, sin: Array):
 
 from einops import rearrange
 
-
-# causal self attention block
 class CausalAttention(nnx.Module):
-    def __init__(self, config=config):
+    def __init__(self, config):
         dim = config.n_embd
         heads = config.n_head
 
@@ -153,82 +151,94 @@ class CausalAttention(nnx.Module):
 
         self.lamb1 = nnx.Param(jnp.array(0.5))
         self.lamb2 = nnx.Param(jnp.array(0.5))
-        self.rms_norm = nnx.RMSNorm(dim, rngs=rngs)
+        # self.rms_norm = nnx.RMSNorm(dim, rngs=rngs)
 
     def __call__(
-        self, x: Array, attn_mask=None, kv_cache=None, freq: tuple = None, v1=None
+        self, x: jax.Array, kv_cache=None, freq: tuple = None, v1=None, pos=None
     ):
-        N, T, D = x.shape
-    
-        # print(f"attn xinx {x.shape}")
+        N, T, D = x.shape  # T should always be 1 during generation
+        # print(f'attn_input {x.shape = }')
+        # Project inputs
+        q = self.q_linear(x)
+        k = self.k_linear(x)
+        v = self.v_linear(x)
 
-        q = self.q_linear(x)  # .reshape(N, T, self.heads, self.head_dim)
-        k = self.k_linear(x)  # .reshape(N, T, self.heads, self.head_dim)
-        v = self.v_linear(x)  # .reshape(N, T, self.heads, self.head_dim)
-
+        # Split into heads
         q, k, v = map(
             lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.heads), (q, k, v)
         )
 
         cos, sin = freq
 
-        if v1 is None:
-            v1 = v
+        # Process residual connection
+        if v1 is not None:
+            v = self.lamb1.value * v + self.lamb2.value * v1
 
-        v = self.lamb1.value * v + self.lamb2.value * v1.reshape(v.shape)
-        # print(f"v after residual: v.shape={v.shape}")
+        # Initialize new cache
 
         new_kv_cache = None
 
-        if kv_cache is not None:  # KV Cache branch - No mask for generation
+        if kv_cache is not None:
             k_cache, v_cache = kv_cache
+            # print(f"sample {q.shape = } / {cos.shape = }")
 
-            q, k = apply_rotary_embed(q, cos, sin), apply_rotary_embed(k, cos, sin)
-            # print(f"q, k after rotary: q.shape={q.shape}, k.shape={k.shape}")
+            q = apply_rotary_embed(q, cos, sin)
+            k = apply_rotary_embed(k, cos, sin)
+
             q, k = rms_norm(q), rms_norm(k)
-            # print(f"q, k after rms_norm: q.shape={q.shape}, k.shape={k.shape}")
 
-            if k_cache is not None and not isinstance(
-                k_cache, int
-            ):  # Added check for int initialization
-                k = jnp.concat([k_cache, k], axis=1)
-                v = jnp.concat([v_cache, v], axis=1)
-                # print(f"k, v after cache concat: k.shape={k.shape}, v.shape={v.shape}")
+            if k_cache is None:  # Changed to k_cache is None
+                cache_size = 1024
+                k_cache = jnp.zeros((N, self.heads, cache_size, self.head_dim))
+                v_cache = jnp.zeros((N, self.heads, cache_size, self.head_dim))
 
-            new_kv_cache = (k, v)
-
-            y = nnx.dot_product_attention(
-                q,
+            k_cache = jax.lax.dynamic_update_slice(
+                k_cache,
                 k,
-                v,
-                # mask=attn_mask, # Removed mask for KV cache case
+                (0, 0, pos, 0),
             )
-            # print(f"Attention output y.shape={y.shape}")
+            v_cache = jax.lax.dynamic_update_slice(
+                v_cache,
+                v,
+                (0, 0, pos, 0),
+            )
 
-        else:  # No KV cache branch - Use causal mask for training
-            q, k = apply_rotary_embed(q, cos, sin), apply_rotary_embed(k, cos, sin)
-            # print(f"q, k after rotary (no cache): q.shape={q.shape}, k.shape={k.shape}")
+            new_kv_cache = (k_cache, v_cache)
+
+            q = rearrange(q, "b h l d -> b l h d")
+            k = rearrange(k, "b h l d -> b l h d")
+            v = rearrange(v, "b h l d -> b l h d")
+
+            y = nnx.dot_product_attention(q, k, v)
+        else:
+            # print(f"train {q.shape = } / {cos.shape = }")
+
+            # Training path with full sequence
+            q = apply_rotary_embed(q, cos, sin)
+            k = apply_rotary_embed(k, cos, sin)
             q, k = rms_norm(q), rms_norm(k)
-            # print(f"q, k after rms_norm (no cache): q.shape={q.shape}, k.shape={k.shape}")
 
-            new_kv_cache = None
+            q = rearrange(q, "b h l d -> b l h d")
+            k = rearrange(k, "b h l d -> b l h d")
+            v = rearrange(v, "b h l d -> b l h d")
 
-            if attn_mask is None:  # Keep mask for training (when kv_cache is None)
-                attn_mask = jnp.tril(jnp.ones((T, T)), k=-1).astype(x.dtype)
+            # print(f"train {q.shape = } / {k.shape = } / {v.shape = }")
 
-            y = nnx.dot_product_attention(
-                q,
-                k,
-                v,
-                # mask=attn_mask,  # Use causal mask for training
-            )
-            # print(f"Attention output y.shape (no cache)={y.shape}")
+            # Causal mask
+            causal_mask = jnp.tril(jnp.ones((T, T)))[None, None, :, :]
 
-        y = y.transpose(0, 2, 1, 3).reshape(x.shape)  # N T D
-        # print(f"y reshaped, {y.shape = }")
+            # mval = jnp.ones((T, T)) * -jnp.inf
+            # attn_mask = jnp.triu(mval.astype(x.dtype), k=1)[None, :, :, None]
+            # attn_mask = jnp.broadcast_to(attn_mask, (N, T, T, D))
+
+            y = nnx.dot_product_attention(q, k, v, mask=causal_mask)
+
+        # Merge heads and project
+        # print(f'pre output = {y.shape}')
+        y = rearrange(y, "b l h d -> b l (h d)")
+        # print(f"arr = {y.shape}")
 
         y = self.out_proj(y)
-        # print(f"y out = {y.shape}")
 
         return (y, v1), new_kv_cache
 
@@ -248,7 +258,7 @@ class MLP(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         x = nnx.relu(self.linear_1(x))
-        x = self.linear_2(jnp.square(x))
+        x = self.linear_2(x)
         return x
 
 
@@ -279,20 +289,48 @@ class DecoderBlock(nnx.Module):
     def __init__(self, config=config):
         self.attn = CausalAttention(config)
         self.mlp = MLP()
-        self.rms_norm = nnx.RMSNorm(config.n_embd, rngs=rngs)
+        # self.rms_norm = nnx.RMSNorm(config.n_embd, rngs=rngs)
 
-    def __call__(self, x, kv_cache=None, freq=None, v1=None):
+    def __call__(self, x, kv_cache=None, freq=None, v1=None, pos=None):
         # print(f"DecoderBlock input x.shape: {x.shape}")  # ADDED PRINT
         (attn_out, v1), new_kv_cache = self.attn(
-            self.rms_norm(x), kv_cache=kv_cache, freq=freq, v1=v1
+            rms_norm(x), kv_cache=kv_cache, freq=freq, v1=v1, pos=pos
         )
         x = x + attn_out
-        x = x + self.mlp(self.rms_norm(x))
+        x = x + self.mlp(rms_norm(x))
 
         return (x, v1), new_kv_cache
 
+    def init_kv_cache(self, batch_size):
+        # return {
+        #     'key': jnp.zeros((batch_size, config.n_head, 0, self.attn.head_dim)),
+        #     'value': jnp.zeros((batch_size, config.n_head, 0, self.attn.head_dim))
+        # }
+        return jnp.zeros((batch_size, config.n_head, 0, self.attn.head_dim)), jnp.zeros((batch_size, config.n_head, 0, self.attn.head_dim))
+
 
 from functools import partial
+from jax import lax
+keyrng = jrand.PRNGKey(config.seed)
+# nnx.split_rngs()
+
+@jax.jit
+def token_match_accuracy(generated_tokens: Array, actual_tokens: Array):
+    # 1. Element-wise comparison: Check for token equality at each position
+    token_matches = generated_tokens == actual_tokens
+    # 2. Count the number of matching tokens
+    num_correct_tokens = jnp.sum(token_matches)
+
+    # 3. Calculate the total number of tokens being compared
+    total_tokens = (
+        generated_tokens.size
+    )  # or actual_tokens.size, shapes should be the same
+
+    # 4. Calculate accuracy: (number of correct tokens) / (total number of tokens)
+    accuracy = num_correct_tokens / total_tokens
+
+    # 5. Return accuracy as a Python float
+    return accuracy
 
 
 # autoregressive transformer for image generation
@@ -312,7 +350,7 @@ class ART(nnx.Module):
             use_bias=False,
         )
         self.rotary = Rotary(config.n_embd // (2 * config.n_head))
-        self.rms_norm = nnx.RMSNorm(config.n_embd, rngs=rngs)
+        # self.rms_norm = nnx.RMSNorm(config.n_embd, rngs=rngs)
 
     def __call__(self, token_idx, cond_labels):
         b, t = token_idx.shape
@@ -326,32 +364,48 @@ class ART(nnx.Module):
 
         x = self.token_embed(token_seq)
         x = x + x[:, 0:1, :]
-        x = self.rms_norm(x)
+        x = rms_norm(x)
 
         v1 = None
         for block in self.layers:
             x, v1 = block(x, freq=freq, v1=v1)[0]
 
-        x = self.rms_norm(x)
+        x = rms_norm(x)
         logits = self.linear_head(x).astype(config.dtype)
 
+        gentokens = nnx.softmax(logits)
+        gentokens = jrand.categorical(randkey, gentokens, axis=-1)
+        # print(f'{gentokens.shape = } / {targets.shape = }')
+        train_token_match = token_match_accuracy(gentokens, targets)
+
+        # loss = optax.softmax_cross_entropy(output, one_hot_targets).mean()
         one_hot_targets = jax.nn.one_hot(
             targets, num_classes=config.vocab_size
         ).reshape(-1, config.vocab_size)
         # print(f'{one_hot_targets.shape = } / {logits.reshape(-1, logits.shape[-1]).shape = }')
 
         loss = optax.softmax_cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
-            one_hot_targets,  # targets.reshape(-1).astype(jnp.int32)[:,None]
+            logits.reshape(-1, logits.shape[-1]), one_hot_targets#targets.reshape(-1).astype(jnp.int32)[:,None]
         ).mean()
         # print(loss)
+        # config.n_embd // config.n_head
+        return logits, loss, train_token_match
 
-        return logits, loss
-
-    # @partial(nnx.jit, static_argnames=("max_tokens", "temp", "cfg_scale", "topk"))
+    # @partial(nnx.ji, static_argnames=("max_tokens", "temp", "cfg_scale", "topk"))
+    # @partial(
+    #     nnx.jit,
+    #     in_shardings=(rep_sharding, rep_sharding, data_sharding, data_sharding),
+    #     out_shardings=(None, None),
+    # )
+    @nnx.jit
     def generate(
-        self, class_labels: Array, max_tokens=1024, temp=1.0, cfg_scale=4.0, topk=None
+        self, class_labels: Array
     ):
+        max_tokens=1024
+        temp=1.0
+        cfg_scale=4.0
+        topk=None
+
         b = class_labels.shape[0]
         # print(f"{class_labels.shape = }")
 
@@ -363,9 +417,10 @@ class ART(nnx.Module):
         x = (class_labels + 65536)[:, None]
         # print(f"x1 {x.shape}")
 
-        kv_caches = [(0, 0)] * len(self.layers)
+        kv_caches = [None] * len(self.layers)  # [(0, 0)] * len(self.layers)
         x_init = self.token_embed(x)
         # print(f"{x_init.shape = }")
+        x_out = jnp.zeros((32, 1024))
 
         freq = self.rotary(x_init, hw=(32, 32))
         # print(f"{freq[0].shape = } / {freq[1].shape = }")
@@ -418,91 +473,7 @@ class ART(nnx.Module):
             # print(f"{idx_next.shape = } / {x_all.shape = }")
 
             x_all = jnp.concat([x_all, idx_next.reshape(x.shape)], axis=1)
-            # print(f"{x_all[:, 1:].shape = }")
+            print(f"{x_all[:, 1:].shape = }")
 
-        return x_all[:, 1:]
-nnx.d
-
-    @partial(nnx.jit, static_argnames=("max_tokens", "temp", "cfg_scale", "topk"))
-    def generate(
-        self,
-        class_labels: jax.Array,
-        rng: jrand.PRNGKey = jrand.PRNGKey(config.seed),
-        max_tokens: int = 1024,
-        temp: float = 1.0,
-        cfg_scale: float = 4.0,
-        topk: int = None,
-    ) -> jax.Array:
-        b = class_labels.shape[0]
-        class_labels = jnp.tile(class_labels, (2,))
-        class_labels = class_labels.at[b].set(1000)
-        x = (class_labels + 65536)[:, None]  # Initial token
-
-        # Pre-allocate output array
-        x_all = jnp.zeros((2 * b, max_tokens + 1), dtype=x.dtype)
-        x_all = x_all.at[:, 0].set(x.squeeze())
-
-        # Initial embeddings and rotary frequencies
-        x_init = self.token_embed(x)
-        dummy_emb = jnp.zeros(
-            (2 * b, max_tokens + 1, x_init.shape[-1])
-        )  # For full sequence length
-        cos, sin = self.rotary(dummy_emb, hw=(32, 32))
-
-        # Initialize KV caches properly (example shape - adjust based on your model)
-        num_heads = 8  # Example value
-        head_dim = 64  # Example value
-        kv_shape = (2 * b, num_heads, max_tokens + 1, head_dim)
-        kv_caches = [(jnp.zeros(kv_shape), jnp.zeros(kv_shape)) for _ in self.layers]
-
-        def loop_body(k, state):
-            x_all, kv_caches, rng = state
-            current_token = x_all[:, k]
-
-            # Embed current token
-            x_emb = self.token_embed(current_token[:, None])
-            x_emb = x_emb + x_init
-            x_emb = self.rms_norm(x_emb)
-
-            # Get rotary embeddings for this position
-            cos_local = cos[:, k : k + 1, :, :]
-            sin_local = sin[:, k : k + 1, :, :]
-            freq_local = (cos_local, sin_local)
-
-            # Process through layers
-            new_kv_caches = []
-            v1 = None
-            current_emb = x_emb
-            for n, layer in enumerate(self.layers):
-                (current_emb, v1), new_kv = layer(
-                    current_emb, kv_cache=kv_caches[n], freq=freq_local, v1=v1
-                )
-                new_kv_caches.append(new_kv)
-
-            # Final processing
-            current_emb = self.rms_norm(current_emb)
-            logits = self.linear_head(current_emb)
-
-            # CFG scaling
-            logits_cond, logits_uncond = logits[:b], logits[b:]
-            logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
-            logits = logits / temp
-
-            # Top-k filtering
-            if topk is not None:
-                v, _ = lax.top_k(logits, min(topk, logits.shape[-1]))
-                logits = jnp.where(logits < v[..., -1:], -jnp.inf, logits)
-
-            # Sampling
-            rng, subkey = jax.random.split(rng)
-            probs = jax.nn.softmax(logits.squeeze(1), axis=-1)
-            next_token = jax.random.categorical(subkey, probs, axis=-1)
-
-            # Update state
-            x_all = x_all.at[:, k + 1].set(next_token)
-            return (x_all, new_kv_caches, rng)
-
-        # Execute the loop
-        final_x, _, _ = lax.fori_loop(0, max_tokens, loop_body, (x_all, kv_caches, rng))
-
-        return final_x[:, 1:]  # Remove initial token
+        x_out = x_all[:, 1:]
+        return x_out
