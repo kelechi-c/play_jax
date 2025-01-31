@@ -13,7 +13,8 @@ mesh = Mesh(mesh_devices, axis_names="axis")
 
 sharding = NamedSharding(mesh, PS("axis"))
 
-sharded_batch = jax.device_put(randtensor, sharding) # ransfer to device
+sharded_batch: jax.Array = jax.device_put(randtensor, sharding) # ransfer to device
+sharded_batch.sharding
 
 print(f"original batch shape => {randtensor.shape}")  # (32, 64, 1024)
 print(f'Sharded shape per device => {sharding.shard_shape(sharded_batch.shape)}')

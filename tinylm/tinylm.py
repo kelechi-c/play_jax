@@ -39,7 +39,7 @@ class TextData(IterableDataset):
         self.dataset = dataset
 
     def __len__(self):
-        return split
+        return config.split
 
     def __iter__(self):
         for sample in self.dataset:
@@ -48,7 +48,7 @@ class TextData(IterableDataset):
                 truncation=True,
                 return_tensors="np",
                 padding="max_length",
-                max_length=128,
+                max_length=64,
             )
 
             token_ids = tokens["input_ids"]
@@ -105,6 +105,7 @@ class DecoderBlock(nnx.Module):
         x = x_token + self.layernorm(self.attention(x_token))
         x = x + self.layernorm(self.ffn_layer(x))
         return x
+
 
 # autoregressive transformer block, or just an SLM
 class Transformer(nnx.Module):

@@ -216,24 +216,24 @@ class DecoderBlock(nnx.Module):
     def __init__(self, rngs: nnx.Rngs, embed_dim=512, attn_heads=8):
         super().__init__()
         self.layernorm = nnx.LayerNorm(embed_dim, rngs=rngs)
-        # self.attention = nnx.MultiHeadAttention(
-        #     num_heads=attn_heads,
-        #     in_features=embed_dim,
-        #     dtype=jnp.bfloat16,
-        #     decode=False,
-        #     rngs=rngs,
-        #     kernel_init=xavier_init,
-        #     bias_init=zero_init,
-        # )
-        self.attention = CausalSelfAttention(
+        self.attention = nnx.MultiHeadAttention(
+            num_heads=attn_heads,
+            in_features=embed_dim,
+            dtype=jnp.bfloat16,
+            decode=True,
             rngs=rngs,
-            embed_dim=embed_dim,
-            attn_heads=attn_heads
+            kernel_init=xavier_init,
+            bias_init=zero_init,
         )
+        # self.attention = CausalSelfAttention(
+        #     rngs=rngs,
+        #     embed_dim=embed_dim,
+        #     attn_heads=attn_heads
+        # )
         self.ffn_layer = MLP(embed_dim, rngs=rngs)
 
     def __call__(self, x_token: Array) -> Array:
-        # self.attention.init_cache(dtype=jnp.bfloat16, input_shape=x_token.shape)
+        self.attention.init_cache(dtype=jnp.bfloat16, input_shape=x_token.shape)
         # print(f'{x_token.shape = }')
         x = x_token + self.layernorm(self.attention(x_token))
         x = x + self.layernorm(self.ffn_layer(x))
@@ -462,7 +462,7 @@ rep_sharding = NS(mesh, PS())
 
 # print('Train_state/model sharding: ')
 # pprint(state_sharding, indent=2, width=150, compact=True)
-
+optax.softmax_cross_entropy_with_integer_labels()
 
 @partial(
     jax.jit,

@@ -142,3 +142,6 @@ def ar_gen(model, tokenizer):
 
     generated_text = tokenizer.decode(generated_tokens)
     print(f"Generated text: {generated_text}")
+
+
+# a = nnx.MultiHeadAttention()

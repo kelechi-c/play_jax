@@ -21,9 +21,9 @@ from cosmos_tokenizer.image_lib import ImageTokenizer
 from huggingface_hub import login, snapshot_download, file_download
 
 
-from ayaka import ART, rms_norm, config as mcfg, token_match_accuracy
+from ar_model import ART, rms_norm, config as mcfg, token_match_accuracy
 
-login("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")
+
 # XLA/JAX flags
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 JAX_TRACEBACK_FILTERING = "off"
@@ -68,19 +68,11 @@ model_name = "Cosmos-0.1-Tokenizer-DI8x8"
 hf_repo = f"nvidia/{model_name}"
 local_dir = "checks"
 # os.makedirs(local_dir, exist_ok=True)
-snapshot_download(repo_id=hf_repo, local_dir=local_dir)
 decoder = ImageTokenizer(checkpoint_dec=f"{local_dir}/cosmos/decoder.jit", device="cpu")
 print("loaded tokenizer")
 
 
-# snapshot_download(repo_id="fal/cosmos-imagenet", local_dir="data/cosmos_imagenet")
-# file_download.hf_hub_download(
-#     repo_id="fal/cosmos-imagenet",
-#     filename="imagenet_di8x8.safetensors",
-#     local_dir="data/cosmos_imagenet",
-#     repo_type="dataset",
-# )
-# print('downloaded data')
+
 class ImageTokenDataset(IterableDataset):
 
     def __init__(
@@ -117,9 +109,6 @@ class ImageTokenDataset(IterableDataset):
     def __iter__(self):
         for tokens, labels in zip(self.indices, self.labels):
             indices = tokens.reshape(-1)
-            # replace randomly with 1000
-            # fill_cond = jrand.normal(randkey, (indices.shape)) < 0.05
-            # indices = jnp.where(fill_cond, indices, 1000)
             class_label = labels
 
             yield {"input_ids": indices, "class_label": class_label}
@@ -170,16 +159,7 @@ def image_grid(pil_images, file, grid_size=(4, 4), figsize=(4, 4)):
 
     return file
 
-
-# @partial(
-#     nnx.jit,
-#     in_shardings=(rep_sharding, data_sharding),
-#     out_shardings=(None),
-# )
-# def ar_generate(model, labels):
-#     return model.generate(labels)
 keyrng = jrand.PRNGKey(config.seed)
-
 
 @partial(
     nnx.jit,
@@ -233,8 +213,6 @@ def generate(self, class_labels: Array):
         cos_local = jax.lax.dynamic_slice_in_dim(cos, i, 1, axis=1)
         sin_local = jax.lax.dynamic_slice_in_dim(sin, i, 1, axis=1)
 
-        # cos_local = cos[:, i : i + 1, :, :] # Use loop index 'i'
-        # sin_local = sin[:, i : i + 1, :, :]
         freq_local = (cos_local, sin_local)
         v1 = None
 
@@ -263,10 +241,7 @@ def generate(self, class_labels: Array):
         print(f"{idx_next.shape = } / {x_all.shape = } / {probs.shape = }")
 
         idx_next = jnp.tile(idx_next, (2,))[:, None]
-        # x_all = jnp.concatenate([x_all, idx_next.reshape(x.shape)], axis=1)
-        # x_all[:, i] = idx_next[:, :1]
-
-        # print(f"{idx_next.shape = } / {x_all.shape = } / {current_index = }")
+        
         # Update x_all at the current column index 'current_index'
         x_all = x_all.at[jnp.arange(x_all.shape[0]), current_index].set(idx_next[:, 0])
 
@@ -281,7 +256,6 @@ def generate(self, class_labels: Array):
 
     final_carry = jax.lax.fori_loop(0, max_tokens, loop_fn, init_carry)
     x_out = final_carry["x_all"][:, 1:]
-    # print(f'{x_out.shape = }')
 
     return x_out
 
@@ -292,12 +266,9 @@ def ar_sample_batch(step, model, batch):
 
     print(f"sampling from labels {labels}")
     labels = jax.device_put(labels, data_sharding)
-    # pred_model = model #device_get_model(model)
-    # pred_model.eval()
 
     image_batch = generate(model, labels)[:16]
-    # image_batch = jax.device_get(image_batch)[:16]
-    # image_batch = ar_generate(pred_model, labels)
+    
     print("gen complete..decoding")
 
     file = f"arsamples/ayaka_{step}.png"
@@ -310,9 +281,6 @@ def ar_sample_batch(step, model, batch):
     jax.clear_caches()
 
     return gridfile, sample_token_match
-
-
-# nnx.while_loop()
 
 
 def wandb_logger(key: str, project_name="ayaka_ar", run_name=None):  # wandb logger
@@ -449,13 +417,6 @@ def main(run, epochs, batch_size):
     train_loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False, collate_fn=jax_collate
     )
-
-    # sp = next(iter(train_loader))
-    # print(
-    #     f"loaded dataset, sample data shape {sp['input_ids'].shape} /  {sp['class_label'].shape}"
-    # )
-
-    # inspect_latents(sp["input_ids"][:16])
 
     ar_model = ART()
     state = nnx.state(ar_model)

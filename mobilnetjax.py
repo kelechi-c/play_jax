@@ -149,7 +149,7 @@ def wandb_logger(key: str, project_name, run_name):  # wandb logger
     # initilaize wandb
     wandb.login(key=key)
     wandb.init(project=project_name, name=run_name)
-
+    wandb.run()
 
 @nnx.jit
 def train_step(model, optimizer, metrics: nnx.MultiMetric, batch):
