@@ -19,9 +19,11 @@ from PIL import Image
 from safetensors import safe_open
 from cosmos_tokenizer.image_lib import ImageTokenizer
 from huggingface_hub import login, snapshot_download, file_download
-from ayaka.ar_model import ART
 
-login('')
+
+from ayaka import ART, rms_norm, config as mcfg, token_match_accuracy
+
+login("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")
 # XLA/JAX flags
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 JAX_TRACEBACK_FILTERING = "off"
@@ -30,7 +32,6 @@ os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 XLA_PYTHON_CLIENT_MEM_FRACTION = 0.20
 JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
 
-file_download.hf_hub_download()
 
 class config:
     batch_size = 128
@@ -66,12 +67,20 @@ rep_sharding = NS(mesh, PS())
 model_name = "Cosmos-0.1-Tokenizer-DI8x8"
 hf_repo = f"nvidia/{model_name}"
 local_dir = "checks"
-os.makedirs(local_dir, exist_ok=True)
+# os.makedirs(local_dir, exist_ok=True)
 snapshot_download(repo_id=hf_repo, local_dir=local_dir)
-decoder = ImageTokenizer(checkpoint_dec=f"{local_dir}/cosmos/decoder.jit", device='tpu')
+decoder = ImageTokenizer(checkpoint_dec=f"{local_dir}/cosmos/decoder.jit", device="cpu")
+print("loaded tokenizer")
 
-snapshot_download(repo_id="fal/cosmos-imagenet", local_dir='data/cosmos_imagenet', repo_type=)
 
+# snapshot_download(repo_id="fal/cosmos-imagenet", local_dir="data/cosmos_imagenet")
+# file_download.hf_hub_download(
+#     repo_id="fal/cosmos-imagenet",
+#     filename="imagenet_di8x8.safetensors",
+#     local_dir="data/cosmos_imagenet",
+#     repo_type="dataset",
+# )
+# print('downloaded data')
 class ImageTokenDataset(IterableDataset):
 
     def __init__(
@@ -80,7 +89,7 @@ class ImageTokenDataset(IterableDataset):
         debug=True,
     ):
         self.safetensor_path = safetensor_path
-        self.split = 100_000
+        self.split = 100
 
         metadata_path = safetensor_path.replace(".safetensors", "_metadata.json")
         with open(metadata_path, "r") as f:
@@ -93,14 +102,14 @@ class ImageTokenDataset(IterableDataset):
         with safe_open(safetensor_path, framework="flax") as f:
             self.indices = (
                 f.get_tensor("indices")
-                .astype(jnp.uint16)
-                .astype(jnp.int64)[: self.split]
+                .astype(jnp.uint16)[: self.split]
+                .astype(jnp.int64)
             )
-            self.labels = f.get_tensor("labels").astype(jnp.int64)[: self.split]
+            self.labels = f.get_tensor("labels")[: self.split].astype(jnp.int32)
 
         if debug:
-            self.indices = self.indices[:16]
-            self.labels = self.labels[:16]
+            self.indices = self.indices[: self.total_samples]
+            self.labels = self.labels[: self.total_samples]
 
     def __len__(self):
         return int(self.total_samples)
@@ -109,20 +118,22 @@ class ImageTokenDataset(IterableDataset):
         for tokens, labels in zip(self.indices, self.labels):
             indices = tokens.reshape(-1)
             # replace randomly with 1000
-            fill_cond = jrand.normal(randkey, (indices.shape)) < 0.05
-            indices = jnp.where(fill_cond, indices, 1000)
+            # fill_cond = jrand.normal(randkey, (indices.shape)) < 0.05
+            # indices = jnp.where(fill_cond, indices, 1000)
             class_label = labels
 
             yield {"input_ids": indices, "class_label": class_label}
 
 
 def decode(data):
+    # print(f'decoder input shape = {data.shape}')
     data = torch.from_numpy(np.array(data))
-    data = data.reshape(1, 32, 32).long()
+    data = data.reshape(1, 32, 32)  # .long()
     # Decode the image
     with torch.no_grad():
         reconstructed = decoder.decode(data)
-    print(f'{reconstructed.shape = }')
+        # print(f'{reconstructed.shape = }')
+
     img = ((reconstructed[0].cpu().float() + 1) * 127.5).clamp(0, 255).to(torch.uint8)
     img = img.permute(1, 2, 0).numpy()
     img = Image.fromarray(img)
@@ -132,13 +143,12 @@ def decode(data):
 
 def inspect_latents(batch):
     batch = [decode(x) for x in batch]
-    file = f"images/imagenet-cosmos.jpg"
+    file = f"images/imagenet-cosmos-16.jpg"
     gridfile = image_grid(batch, file)
-    
     print(f"sample saved @ {gridfile}")
 
 
-def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 4)):
+def image_grid(pil_images, file, grid_size=(4, 4), figsize=(4, 4)):
     rows, cols = grid_size
     assert len(pil_images) <= rows * cols, "Grid size must accommodate all images."
 
@@ -160,32 +170,152 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 4)):
 
     return file
 
-# jax.lax.scan()
-nnx.scan(image_grid)
+
+# @partial(
+#     nnx.jit,
+#     in_shardings=(rep_sharding, data_sharding),
+#     out_shardings=(None),
+# )
+# def ar_generate(model, labels):
+#     return model.generate(labels)
+keyrng = jrand.PRNGKey(config.seed)
+
+
+@partial(
+    nnx.jit,
+    in_shardings=(rep_sharding, data_sharding),
+    # out_shardings=(None,),
+)
+def generate(self, class_labels: Array):
+    max_tokens = 1024
+    temp = 1.0
+    cfg_scale = 4.0
+    topk = None
+
+    b = class_labels.shape[0]
+
+    class_labels = jnp.tile(class_labels, (2,))
+    class_labels = class_labels.at[b].set(1000)
+    x = (class_labels + 65536)[:, None]
+
+    kv_caches = [None] * len(self.layers)
+    x_init = self.token_embed(x)
+    freq = self.rotary(x_init, hw=(32, 32))
+    cos, sin = freq
+    cos, sin = cos.value, sin.value
+
+    x_all = jnp.zeros((b * 2, max_tokens + 1)).astype(
+        jnp.int64
+    )  # jnp.broadcast_to(x, (2*b, max_tokens + 1))
+
+    init_carry = {
+        "x_all": x_all,  # Now x_all is pre-allocated
+        "kv_caches": kv_caches,
+        "current_index": 1,  # Start filling from the second column (index 1)
+        "randkey": jrand.key(config.seed),
+        "x_init_emb": x_init,  # Pass initial embedding for addition
+    }
+
+    def loop_fn(i, carry):
+        # print(i)
+        x_all = carry["x_all"]
+        # print(f'{x_all.shape = }')
+        kv_caches = carry["kv_caches"]
+        current_index = carry["current_index"]
+        randkey = carry["randkey"]
+        x_init_emb = carry["x_init_emb"]
+        b = x_all.shape[0] // 2  # Get batch size
+
+        x_emb = self.token_embed(x_all[:, -1:])
+        x_emb = x_emb + x_init
+
+        x_emb = rms_norm(x_emb)
+        cos_local = jax.lax.dynamic_slice_in_dim(cos, i, 1, axis=1)
+        sin_local = jax.lax.dynamic_slice_in_dim(sin, i, 1, axis=1)
+
+        # cos_local = cos[:, i : i + 1, :, :] # Use loop index 'i'
+        # sin_local = sin[:, i : i + 1, :, :]
+        freq_local = (cos_local, sin_local)
+        v1 = None
+
+        for n, layer in enumerate(self.layers):
+            (x_emb, v1), new_kv_cache = layer(
+                x_emb, kv_cache=kv_caches[n], freq=freq_local, v1=None, pos=i
+            )
+            kv_caches[n] = new_kv_cache
+
+        x_emb = rms_norm(x_emb)
+        logits = self.linear_head(x_emb).squeeze(1)
+        # print(f'{logits.shape = }')
+
+        logits_cond = logits[0::2, :]
+        logits_uncond = logits[1::2, :]
+        logits = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
+        logits = logits / temp
+
+        if topk is not None:
+            v, _ = jax.lax.top_k(logits, min(topk, logits.shape[-1]))
+            logits = jnp.where(logits < v[:, [-1]], -jnp.inf, logits)
+
+        probs = nnx.softmax(logits, axis=-1)
+        randkey, idx_key = jrand.split(randkey)  # Split random key
+        idx_next = jrand.categorical(idx_key, probs, axis=1)
+        print(f"{idx_next.shape = } / {x_all.shape = } / {probs.shape = }")
+
+        idx_next = jnp.tile(idx_next, (2,))[:, None]
+        # x_all = jnp.concatenate([x_all, idx_next.reshape(x.shape)], axis=1)
+        # x_all[:, i] = idx_next[:, :1]
+
+        # print(f"{idx_next.shape = } / {x_all.shape = } / {current_index = }")
+        # Update x_all at the current column index 'current_index'
+        x_all = x_all.at[jnp.arange(x_all.shape[0]), current_index].set(idx_next[:, 0])
+
+        new_carry = {
+            "x_all": x_all,
+            "kv_caches": kv_caches,
+            "current_index": current_index + 1,  # Increment column index
+            "randkey": randkey,
+            "x_init_emb": x_init_emb,
+        }
+        return new_carry
+
+    final_carry = jax.lax.fori_loop(0, max_tokens, loop_fn, init_carry)
+    x_out = final_carry["x_all"][:, 1:]
+    # print(f'{x_out.shape = }')
+
+    return x_out
+
+
 def ar_sample_batch(step, model, batch):
     labels = batch["class_label"][:16]
+    realtokens = batch["input_ids"][:16]
+
     print(f"sampling from labels {labels}")
+    labels = jax.device_put(labels, data_sharding)
+    # pred_model = model #device_get_model(model)
+    # pred_model.eval()
 
-    pred_model = model #device_get_model(model)
-    pred_model.eval()
-
-    image_batch = pred_model.generate(labels)
-    image_batch = jax.device_get(image_batch)
+    image_batch = generate(model, labels)[:16]
+    # image_batch = jax.device_get(image_batch)[:16]
     # image_batch = ar_generate(pred_model, labels)
-    print('gen complete..decoding')
+    print("gen complete..decoding")
 
     file = f"arsamples/ayaka_{step}.png"
     batch = [decode(x) for x in image_batch]
     gridfile = image_grid(batch, file)
+    print(f"saved @ {gridfile}")
 
-    del pred_model
+    sample_token_match = token_match_accuracy(image_batch, realtokens).item() * 100
+    print(f"{sample_token_match = }")
     jax.clear_caches()
-    gc.collect()
 
-    return gridfile
+    return gridfile, sample_token_match
 
 
-def wandb_logger(key: str, project_name='ayaka_ar', run_name=None):  # wandb logger
+# nnx.while_loop()
+
+
+def wandb_logger(key: str, project_name="ayaka_ar", run_name=None):  # wandb logger
     # initilaize wandb
     wandb.login(key=key)
     wandb.init(
@@ -234,19 +364,21 @@ def load_paramdict_pickle(model, filename="model.ckpt"):
 @partial(
     nnx.jit,
     in_shardings=(rep_sharding, rep_sharding, data_sharding, data_sharding),
-    out_shardings=(None, None),
+    out_shardings=(None, None, None),
 )
 def train_step(model, optimizer, tokens, label):
-    def loss_func(model, tokens, label):
-        logits, loss = model(tokens, label)
-        return loss
 
-    gradfn = nnx.value_and_grad(loss_func)
-    loss, grads = gradfn(model, tokens, label)
+    def loss_func(model, tokens, label):
+        logits, loss, token_match = model(tokens, label)
+
+        return loss, token_match
+
+    gradfn = nnx.value_and_grad(loss_func, has_aux=True)
+    (loss, token_match), grads = gradfn(model, tokens, label)
     grad_norm = optax.global_norm(grads)
     optimizer.update(grads)
 
-    return loss, grad_norm
+    return loss, token_match * 100, grad_norm
 
 
 def overfit(epochs, model, optimizer, train_loader, schedule):
@@ -254,32 +386,38 @@ def overfit(epochs, model, optimizer, train_loader, schedule):
     model.train()
 
     batch = next(iter(train_loader))
-    wandb_logger(key="yourkey", run_name='ayaka_overfit')
+    gridfile = ar_sample_batch("test", model, batch)
+
+    wandb_logger(key="")
     stime = time.time()
 
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
         lr = schedule(epoch)
-        latent, text_embed = batch["input_ids"], batch["class_labels"]
-        train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)
+        latent, text_embed = batch["input_ids"], batch["class_label"]
+        train_loss, token_match, grad_norm = train_step(
+            model, optimizer, latent, text_embed
+        )
+
         print(
-            f"step {epoch}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm.item()}"
+            f"step {epoch}, loss-> {train_loss.item():.5f}, grad_norm {grad_norm.item()}"
         )
 
         wandb.log(
             {
                 "loss": train_loss.item(),
                 "log_loss": math.log10(train_loss.item() + 1e-8),
+                "token_match/train": token_match.item(),
                 "grad_norm": grad_norm.item(),
                 "log_grad_norm": math.log10(grad_norm.item() + 1e-8),
                 "lr": lr,
             }
         )
 
-        if epoch % 25 == 0 and epoch != 0:
-            gridfile = ar_sample_batch(epoch, model, batch)
+        if epoch % 25 == 0:
+            gridfile, s_token_match = ar_sample_batch(epoch, model, batch)
             image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log})
+            wandb.log({"image_sample": image_log, "token_match/sample": s_token_match})
 
         jax.clear_caches()
         gc.collect()
@@ -293,11 +431,11 @@ def overfit(epochs, model, optimizer, train_loader, schedule):
 
 def jax_collate(batch):
     tokens = jnp.stack([jnp.array(item["input_ids"]) for item in batch], axis=0)
-    labels = jnp.stack([jnp.array(item["class_labes"]) for item in batch], axis=0)
+    labels = jnp.stack([jnp.array(item["class_label"]) for item in batch], axis=0)
 
     return {
         "input_ids": tokens,
-        "class_labels": labels,
+        "class_label": labels,
     }
 
 
@@ -308,17 +446,19 @@ def jax_collate(batch):
 def main(run, epochs, batch_size):
 
     dataset = ImageTokenDataset()
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=jax_collate)
-
-    sp = next(iter(train_loader))
-    print(
-        f"loaded dataset, sample data shape {sp['input_ids'].shape} /  {sp['class_label'].shape}"
+    train_loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, collate_fn=jax_collate
     )
 
-    inspect_latents(sp["input_ids"])
+    # sp = next(iter(train_loader))
+    # print(
+    #     f"loaded dataset, sample data shape {sp['input_ids'].shape} /  {sp['class_label'].shape}"
+    # )
+
+    # inspect_latents(sp["input_ids"][:16])
 
     ar_model = ART()
-    graph, state = nnx.split(ar_model)
+    state = nnx.state(ar_model)
 
     n_params = sum([p.size for p in jax.tree.leaves(state)])
     print(f"model parameters count: {n_params/1e6:.2f}M")
@@ -330,15 +470,12 @@ def main(run, epochs, batch_size):
         init_value=initial_learning_rate,
         end_value=end_learning_rate,
         power=power,
-        transition_steps=5000
+        transition_steps=1000,
     )
 
     optimizer = nnx.Optimizer(
         ar_model,
-        optax.chain(
-            optax.clip_by_global_norm(2.0),
-            optax.adamw(schedule, b1=0.9, b2=0.995, eps=1e-9, weight_decay=0.001),
-        ),
+        optax.adamw(schedule, b1=0.9, b2=0.995, eps=1e-9, weight_decay=0.001)
     )
     if run == "overfit":
         model, loss = overfit(epochs, ar_model, optimizer, train_loader, schedule)
